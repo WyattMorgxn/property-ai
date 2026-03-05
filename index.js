@@ -1,7 +1,7 @@
 import express from "express";
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (req, res) => {
   res.send("Property AI Server Running");
