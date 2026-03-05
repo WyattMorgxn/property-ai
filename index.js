@@ -11,16 +11,10 @@ app.post("/twilio/inbound", (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
 
-  console.log("Message from:", from);
-  console.log("Message:", body);
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>Maintenance request received. We will contact a technician.</Message>
+</Response>`;
 
-  res
-    .status(200)
-    .type("text/xml")
-    .send(`<Response>
-<Message>Maintenance request received. We will contact a technician.</Message>
-</Response>`);
+res.status(200).set("Content-Type", "text/xml").send(twiml);
 });
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server running on port " + port));
