@@ -2,27 +2,26 @@ import express from "express";
 
 const app = express();
 
-// Twilio sends webhooks as x-www-form-urlencoded
+// Twilio sends form-encoded data
 app.use(express.urlencoded({ extended: false }));
 
-// Quick health check
+// Log every request so you can see what Twilio is hitting
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Health check
 app.get("/", (req, res) => {
   res.status(200).send("Property AI Server Running");
 });
 
-// Function to return TwiML reply
-function replyTwiml(res, message) {
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Message>${message}</Message>
-</Response>`;
+// Helpful browser test (so /sms doesn't look "broken" in a browser)
+app.get("/sms", (req, res) => {
+  res.status(200).send("SMS endpoint alive. Twilio must POST here.");
+});
 
-  res.status(200);
-  res.set("Content-Type", "text/xml");
-  return res.send(twiml);
-}
-
-// Handle inbound SMS (use this in Twilio webhook URL)
+// Inbound SMS webhook (Twilio will POST here)
 app.post("/sms", (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
@@ -30,18 +29,17 @@ app.post("/sms", (req, res) => {
   console.log("Incoming SMS from:", from);
   console.log("Message:", body);
 
-  return replyTwiml(res, "Maintenance request received. We will contact a technician.");
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>Maintenance request received. We will contact a technician.</Message>
+</Response>`;
+
+  res.status(200).set("Content-Type", "text/xml").send(twiml);
 });
 
-// ALSO support the old route, just in case your Twilio URL is still set to it
-app.post("/twilio/inbound", (req, res) => {
-  const from = req.body.From;
-  const body = req.body.Body;
-
-  console.log("Incoming SMS from:", from);
-  console.log("Message:", body);
-
-  return replyTwiml(res, "Maintenance request received. We will contact a technician.");
+// fallback so you see if Twilio hits the wrong path
+app.use((req, res) => {
+  res.status(404).send(`Not Found: ${req.method} ${req.path}`);
 });
 
 const port = process.env.PORT || 3000;
