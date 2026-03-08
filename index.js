@@ -11,13 +11,67 @@ app.use((req, res, next) => {
   next();
 });
 
-// Homepage
+// Homepage (Landing page for your domain)
 app.get("/", (req, res) => {
   res.status(200).send(`
-    <h1>Tenant Flow AI</h1>
-    <p>AI-powered tenant maintenance communication for property managers.</p>
-    <p>Tenants can report maintenance issues by SMS. Our system helps acknowledge requests, organize responses, and support maintenance communication workflows.</p>
-    <p>Contact: wyattmorgan@tenant-flow-ai.com</p>
+  <html>
+    <head>
+      <title>Tenant Flow AI</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          background-color: #f5f7fb;
+          text-align: center;
+          padding: 60px;
+          color: #333;
+        }
+        h1 {
+          font-size: 42px;
+          margin-bottom: 10px;
+        }
+        p {
+          font-size: 18px;
+          max-width: 700px;
+          margin: 10px auto;
+        }
+        .contact {
+          margin-top: 30px;
+          font-weight: bold;
+        }
+        footer {
+          margin-top: 60px;
+          font-size: 14px;
+          color: #777;
+        }
+      </style>
+    </head>
+
+    <body>
+      <h1>Tenant Flow AI</h1>
+
+      <p>
+        AI-powered tenant maintenance communication platform for property managers.
+      </p>
+
+      <p>
+        Tenants can report maintenance issues via SMS. The system acknowledges
+        requests, classifies urgency, and helps notify property management staff.
+      </p>
+
+      <p>
+        Built to support property management communication workflows and
+        maintenance request handling.
+      </p>
+
+      <p class="contact">
+        Contact: wyattmorgan@tenant-flow-ai.com
+      </p>
+
+      <footer>
+        © ${new Date().getFullYear()} Tenant Flow AI
+      </footer>
+    </body>
+  </html>
   `);
 });
 
@@ -44,7 +98,7 @@ app.post("/sms", (req, res) => {
 
 // fallback so you see if Twilio hits the wrong path
 app.use((req, res) => {
-  res.status(404).send(`Not Found: ${req.method} ${req.path}`);
+  res.status(404).send(\`Not Found: \${req.method} \${req.path}\`);
 });
 
 const port = process.env.PORT || 3000;
