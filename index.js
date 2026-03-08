@@ -11,9 +11,14 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
+// Homepage
 app.get("/", (req, res) => {
-  res.status(200).send("Property AI Server Running");
+  res.status(200).send(`
+    <h1>Tenant Flow AI</h1>
+    <p>AI-powered tenant maintenance communication for property managers.</p>
+    <p>Tenants can report maintenance issues by SMS. Our system helps acknowledge requests, organize responses, and support maintenance communication workflows.</p>
+    <p>Contact: wyattmorgan@tenant-flow-ai.com</p>
+  `);
 });
 
 // Helpful browser test (so /sms doesn't look "broken" in a browser)
