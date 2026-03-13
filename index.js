@@ -21,7 +21,8 @@ app.get("/", (req, res) => {
           'body { font-family: Arial, sans-serif; background: #f5f7fb; text-align: center; padding: 60px; color: #333; }' +
           'h1 { font-size: 42px; margin-bottom: 10px; }' +
           'p { font-size: 18px; max-width: 700px; margin: 10px auto; line-height: 1.5; }' +
-          '.contact { margin-top: 30px; font-weight: bold; }' +
+          '.owner { margin-top: 25px; font-weight: bold; }' +
+          '.contact { margin-top: 20px; font-weight: bold; }' +
           'footer { margin-top: 60px; font-size: 14px; color: #777; }' +
         '</style>' +
       '</head>' +
@@ -30,6 +31,7 @@ app.get("/", (req, res) => {
         '<p>AI-powered tenant maintenance communication platform for property managers.</p>' +
         '<p>Tenants can report maintenance issues via SMS. The system acknowledges requests, classifies urgency, and helps notify property management staff.</p>' +
         '<p>Built to support property management communication workflows and maintenance request handling.</p>' +
+        '<p class="owner">Tenant Flow AI is owned and operated by Wyatt D Morgan.</p>' +
         '<p class="contact">Contact: wyattmorgan@tenant-flow-ai.com</p>' +
         '<footer>&copy; 2026 Tenant Flow AI</footer>' +
       '</body>' +
