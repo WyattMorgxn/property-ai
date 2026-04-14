@@ -11,9 +11,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ======================
-// HOMEPAGE (UPGRADED)
-// ======================
+// Homepage
 app.get("/", (req, res) => {
   res.status(200).send(
     '<html>' +
@@ -42,16 +40,19 @@ app.get("/", (req, res) => {
         '<p>Built to support property management communication workflows and maintenance request handling.</p>' +
 
         '<p class="section-title">How It Works</p>' +
-        '<p>Tenants send a text message describing an issue. Tenant Flow AI processes the request, categorizes urgency, and automatically notifies the appropriate property manager or maintenance personnel. Updates are sent back to the tenant via SMS.</p>' +
+        '<p>Tenants send a text message describing an issue. Tenant Flow AI processes the request, categorizes urgency, and automatically notifies the appropriate property manager or maintenance personnel. Updates are then sent back to the tenant via SMS.</p>' +
 
         '<p class="section-title">Example</p>' +
-        '<p>A tenant texts "My sink is leaking." Tenant Flow AI processes the request and notifies maintenance. The tenant then receives an update such as "A technician has been scheduled and will arrive shortly."</p>' +
+        '<p>A tenant texts "My sink is leaking." Tenant Flow AI processes the issue, notifies the appropriate maintenance contact, and sends updates back to the tenant such as "A technician has been scheduled and will arrive shortly."</p>' +
 
         '<p class="section-title">About Tenant Flow AI</p>' +
         '<p>Tenant Flow AI is a communication platform designed to streamline maintenance coordination between tenants and property managers. It improves response time, automates communication workflows, and enhances tenant satisfaction.</p>' +
 
+        '<p class="section-title">How to Get Started</p>' +
+        '<p>Tenants can start by texting the Tenant Flow AI phone number to report a maintenance issue or communicate with property management. By sending the first text message, the tenant agrees to receive conversational SMS responses related to maintenance issues, scheduling updates, service communication, and issue resolution. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
+
         '<p class="section-title">SMS Consent & Compliance</p>' +
-        '<p>Users opt in by sending a text message to Tenant Flow AI to report maintenance issues or communicate with property management. By initiating contact, users consent to receive SMS messages related to service requests, updates, scheduling, and communication. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
+        '<p>Users opt in by initiating contact via text message. Tenant Flow AI only sends service-related SMS messages connected to maintenance issues, property management communication, and scheduling. No marketing messages are sent through this program.</p>' +
 
         '<p class="owner">Tenant Flow AI is owned and operated by Wyatt D Morgan.</p>' +
 
@@ -72,16 +73,12 @@ app.get("/", (req, res) => {
   );
 });
 
-// ======================
-// SMS TEST
-// ======================
+// Helpful browser test
 app.get("/sms", (req, res) => {
   res.status(200).send("SMS endpoint alive. Twilio must POST here.");
 });
 
-// ======================
-// SMS WEBHOOK
-// ======================
+// Inbound SMS webhook
 app.post("/sms", (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
@@ -92,67 +89,75 @@ app.post("/sms", (req, res) => {
   const twiml =
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-    '<Message>Tenant Flow AI: Your request has been received and forwarded. A technician will be there shortly to resolve the issue.</Message>' +
+    '<Message>Tenant Flow AI: We received your message and notified the appropriate party. A technician will be there shortly to resolve the issue. Reply STOP to opt out or HELP for assistance.</Message>' +
     '</Response>';
 
   res.status(200).set("Content-Type", "text/xml").send(twiml);
 });
 
-// ======================
-// PRIVACY POLICY (STRONG)
-// ======================
+// Privacy Policy page
 app.get("/privacy", (req, res) => {
   res.status(200).send(
-    '<html><head><title>Privacy Policy</title></head><body style="font-family: Arial; padding:40px; max-width:900px; margin:auto;">' +
+    '<html><head><title>Privacy Policy</title><style>body { font-family: Arial, sans-serif; background: #f5f7fb; padding: 40px; color: #333; max-width: 900px; margin: auto; line-height: 1.7; } h1 { font-size: 36px; margin-bottom: 20px; } h2 { font-size: 24px; margin-top: 30px; } p { font-size: 18px; margin-bottom: 15px; }</style></head><body>' +
 
     '<h1>Privacy Policy</h1>' +
 
     '<p>Tenant Flow AI collects phone numbers and message content for the purpose of facilitating communication between tenants, property managers, and maintenance personnel.</p>' +
 
-    '<p>Information is used strictly for service-related communication such as maintenance requests, updates, and scheduling.</p>' +
+    '<h2>Information We Collect</h2>' +
+    '<p>We may collect phone numbers, message content, maintenance issue details, and communication history when users interact with the platform.</p>' +
 
-    '<p>Tenant Flow AI does not sell or share personal data with third parties for marketing purposes.</p>' +
+    '<h2>How We Use Information</h2>' +
+    '<p>We use this information solely for service-related communication, including maintenance requests, scheduling updates, issue resolution, and property management communication.</p>' +
 
-    '<p>By messaging Tenant Flow AI, users consent to receive SMS messages related to service requests and communication.</p>' +
+    '<h2>Information Sharing</h2>' +
+    '<p>Tenant Flow AI does not sell or share personal information with third parties for marketing purposes. Information is only used as necessary to coordinate requested services or comply with legal obligations.</p>' +
 
-    '<p>Message frequency varies. Message and data rates may apply.</p>' +
+    '<h2>SMS Messaging</h2>' +
+    '<p>Users opt in by sending the first text message to Tenant Flow AI to report a maintenance issue or communicate with property management. By texting first, users consent to receive conversational SMS messages related to maintenance requests, updates, scheduling, and service communication. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
 
-    '<p>Users can opt out at any time by replying STOP or request help by replying HELP.</p>' +
-
-    '<p>Contact: wyattmorgan@tenant-flow-ai.com</p>' +
+    '<h2>Contact</h2>' +
+    '<p>For questions, contact wyattmorgan@tenant-flow-ai.com.</p>' +
 
     '</body></html>'
   );
 });
 
-// ======================
-// TERMS (STRONG)
-// ======================
+// Terms and Conditions page
 app.get("/terms", (req, res) => {
   res.status(200).send(
-    '<html><head><title>Terms and Conditions</title></head><body style="font-family: Arial; padding:40px; max-width:900px; margin:auto;">' +
+    '<html><head><title>Terms and Conditions</title><style>body { font-family: Arial, sans-serif; background: #f5f7fb; padding: 40px; color: #333; max-width: 900px; margin: auto; line-height: 1.7; } h1 { font-size: 36px; margin-bottom: 20px; } h2 { font-size: 24px; margin-top: 30px; } p { font-size: 18px; margin-bottom: 15px; }</style></head><body>' +
 
     '<h1>Terms and Conditions</h1>' +
 
-    '<p>Tenant Flow AI provides SMS-based communication for maintenance requests and property management coordination.</p>' +
+    '<p>These Terms and Conditions govern the use of Tenant Flow AI messaging services.</p>' +
 
-    '<p>By using this service, you agree to receive conversational SMS messages related to tenant communication and maintenance coordination.</p>' +
+    '<h2>Program Description</h2>' +
+    '<p>Tenant Flow AI provides SMS-based communication for maintenance requests, scheduling updates, issue resolution, and property management communication between tenants, property managers, and maintenance personnel.</p>' +
 
-    '<p>Message frequency varies depending on activity and updates.</p>' +
+    '<h2>Consent to Receive Messages</h2>' +
+    '<p>Users consent to receive messages by sending the first text message to Tenant Flow AI to report a maintenance issue or communicate with property management.</p>' +
 
-    '<p>Message and data rates may apply.</p>' +
+    '<h2>Message Frequency</h2>' +
+    '<p>Message frequency varies depending on maintenance activity, scheduling updates, and communication needs.</p>' +
 
-    '<p>To opt out, reply STOP at any time. For assistance, reply HELP.</p>' +
+    '<h2>Fees</h2>' +
+    '<p>Message and data rates may apply depending on the user’s mobile carrier and messaging plan.</p>' +
 
+    '<h2>Opt-Out</h2>' +
+    '<p>Users may opt out at any time by replying STOP.</p>' +
+
+    '<h2>Help</h2>' +
+    '<p>Users may reply HELP for assistance.</p>' +
+
+    '<h2>Support Contact</h2>' +
     '<p>For support, contact wyattmorgan@tenant-flow-ai.com.</p>' +
 
     '</body></html>'
   );
 });
 
-// ======================
-// FALLBACK
-// ======================
+// Fallback
 app.use((req, res) => {
   res.status(404).send("Not Found: " + req.method + " " + req.path);
 });
