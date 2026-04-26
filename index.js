@@ -5,13 +5,78 @@ const app = express();
 // Twilio sends form-encoded data
 app.use(express.urlencoded({ extended: false }));
 
-// Log every request
+// ─────────────────────────────────────────────
+// OPT-IN STORE
+// In-memory for now — swap this for a real DB
+// (Railway Postgres or Redis) in production so
+// it survives restarts.
+// ─────────────────────────────────────────────
+const optedInUsers = new Map();   // phone → { timestamp, optedOut }
+
+function isFirstTimeTexter(phone) {
+  return !optedInUsers.has(phone);
+}
+
+function isOptedOut(phone) {
+  return optedInUsers.get(phone)?.optedOut === true;
+}
+
+function recordOptIn(phone) {
+  optedInUsers.set(phone, { timestamp: new Date().toISOString(), optedOut: false });
+  console.log(`[OPT-IN]  ${phone} at ${new Date().toISOString()}`);
+}
+
+function recordOptOut(phone) {
+  const existing = optedInUsers.get(phone) || {};
+  optedInUsers.set(phone, { ...existing, optedOut: true, optOutTimestamp: new Date().toISOString() });
+  console.log(`[OPT-OUT] ${phone} at ${new Date().toISOString()}`);
+}
+
+// ─────────────────────────────────────────────
+// COMPLIANCE MESSAGE TEMPLATES
+// ─────────────────────────────────────────────
+const OPT_IN_CONFIRMATION =
+  "Welcome to Tenant Flow AI! By texting this number you consent to receive " +
+  "conversational SMS messages for maintenance requests, scheduling updates, and " +
+  "property management communication. Msg frequency varies. Msg & data rates may " +
+  "apply. Reply STOP to opt out at any time or HELP for assistance.";
+
+const HELP_REPLY =
+  "Tenant Flow AI Help: Text us to report maintenance issues and we will route " +
+  "your request to the right person. Msg & data rates may apply. Reply STOP to " +
+  "opt out. Support: wyattmorgan@tenant-flow-ai.com";
+
+// Keywords Twilio auto-handles for STOP, but we log them ourselves too
+const STOP_KEYWORDS  = new Set(["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"]);
+const START_KEYWORDS = new Set(["START", "UNSTOP", "YES"]);
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+function twimlResponse(message) {
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    "<Response>" +
+    "<Message>" + message + "</Message>" +
+    "</Response>"
+  );
+}
+
+function emptyTwiml() {
+  return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+}
+
+// ─────────────────────────────────────────────
+// LOGGING MIDDLEWARE
+// ─────────────────────────────────────────────
 app.use((req, res, next) => {
   console.log("[" + new Date().toISOString() + "] " + req.method + " " + req.path);
   next();
 });
 
-// Homepage
+// ─────────────────────────────────────────────
+// HOMEPAGE
+// ─────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.status(200).send(
     '<html>' +
@@ -52,7 +117,7 @@ app.get("/", (req, res) => {
         '<p>Tenants can start by texting the Tenant Flow AI phone number to report a maintenance issue or communicate with property management. By sending the first text message, the tenant agrees to receive conversational SMS responses related to maintenance issues, scheduling updates, service communication, and issue resolution. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
 
         '<p class="section-title">SMS Consent & Compliance</p>' +
-        '<p>Users opt in by initiating contact via text message. Tenant Flow AI only sends service-related SMS messages connected to maintenance issues, property management communication, and scheduling. No marketing messages are sent through this program.</p>' +
+        '<p>Users opt in by initiating contact via text message. Upon first contact, users automatically receive a confirmation message acknowledging their opt-in and explaining their rights. Tenant Flow AI only sends service-related SMS messages connected to maintenance issues, property management communication, and scheduling. No marketing messages are sent through this program.</p>' +
 
         '<p class="owner">Tenant Flow AI is owned and operated by Wyatt D Morgan.</p>' +
 
@@ -73,29 +138,85 @@ app.get("/", (req, res) => {
   );
 });
 
-// Helpful browser test
+// ─────────────────────────────────────────────
+// SMS ENDPOINT — GET (browser health check)
+// ─────────────────────────────────────────────
 app.get("/sms", (req, res) => {
   res.status(200).send("SMS endpoint alive. Twilio must POST here.");
 });
 
-// Inbound SMS webhook
+// ─────────────────────────────────────────────
+// SMS ENDPOINT — POST (Twilio webhook)
+// ─────────────────────────────────────────────
 app.post("/sms", (req, res) => {
-  const from = req.body.From;
-  const body = req.body.Body;
+  const from = req.body.From || "";
+  const body = (req.body.Body || "").trim();
+  const keyword = body.toUpperCase();
 
   console.log("Incoming SMS from:", from);
   console.log("Message:", body);
 
-  const twiml =
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response>' +
-    '<Message>Tenant Flow AI: We received your message and notified the appropriate party. A technician will be there shortly to resolve the issue. Reply STOP to opt out or HELP for assistance.</Message>' +
-    '</Response>';
+  // 1. STOP / opt-out keywords
+  //    Twilio auto-responds and blocks future messages, but we log it ourselves.
+  if (STOP_KEYWORDS.has(keyword)) {
+    recordOptOut(from);
+    // Return empty TwiML — Twilio sends its own STOP reply
+    return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
+  }
 
-  res.status(200).set("Content-Type", "text/xml").send(twiml);
+  // 2. START / UNSTOP — re-opt them in
+  if (START_KEYWORDS.has(keyword)) {
+    recordOptIn(from);
+    return res
+      .status(200)
+      .set("Content-Type", "text/xml")
+      .send(twimlResponse(OPT_IN_CONFIRMATION));
+  }
+
+  // 3. HELP keyword
+  if (keyword === "HELP") {
+    return res
+      .status(200)
+      .set("Content-Type", "text/xml")
+      .send(twimlResponse(HELP_REPLY));
+  }
+
+  // 4. Opted-out users — do not respond
+  if (isOptedOut(from)) {
+    console.log(`[BLOCKED] ${from} is opted out, ignoring message.`);
+    return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
+  }
+
+  // 5. First-time texter — send opt-in confirmation FIRST, then process
+  if (isFirstTimeTexter(from)) {
+    recordOptIn(from);
+
+    // Send the opt-in confirmation as the first reply.
+    // The tenant's actual request will be handled on their next message,
+    // OR you can chain a second Twilio outbound message here using the REST API
+    // so they get both the confirmation AND the acknowledgement in one go.
+    return res
+      .status(200)
+      .set("Content-Type", "text/xml")
+      .send(twimlResponse(OPT_IN_CONFIRMATION));
+  }
+
+  // 6. Returning, opted-in tenant — process their maintenance request
+  //    👇 Put your Claude / routing logic here
+  console.log(`[PROCESSING] Maintenance request from ${from}: ${body}`);
+
+  const twiml = twimlResponse(
+    "Tenant Flow AI: We received your message and notified the appropriate party. " +
+    "A technician will be in touch shortly to resolve the issue. " +
+    "Reply STOP to opt out or HELP for assistance."
+  );
+
+  return res.status(200).set("Content-Type", "text/xml").send(twiml);
 });
 
-// Privacy Policy page
+// ─────────────────────────────────────────────
+// PRIVACY POLICY
+// ─────────────────────────────────────────────
 app.get("/privacy", (req, res) => {
   res.status(200).send(
     '<html><head><title>Privacy Policy</title><style>body { font-family: Arial, sans-serif; background: #f5f7fb; padding: 40px; color: #333; max-width: 900px; margin: auto; line-height: 1.7; } h1 { font-size: 36px; margin-bottom: 20px; } h2 { font-size: 24px; margin-top: 30px; } p { font-size: 18px; margin-bottom: 15px; }</style></head><body>' +
@@ -113,8 +234,11 @@ app.get("/privacy", (req, res) => {
     '<h2>Information Sharing</h2>' +
     '<p>Tenant Flow AI does not sell or share personal information with third parties for marketing purposes. Information is only used as necessary to coordinate requested services or comply with legal obligations.</p>' +
 
-    '<h2>SMS Messaging</h2>' +
-    '<p>Users opt in by sending the first text message to Tenant Flow AI to report a maintenance issue or communicate with property management. By texting first, users consent to receive conversational SMS messages related to maintenance requests, updates, scheduling, and service communication. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
+    '<h2>SMS Messaging & Opt-In</h2>' +
+    '<p>Users opt in by sending the first text message to Tenant Flow AI to report a maintenance issue or communicate with property management. Upon first contact, users automatically receive a confirmation message acknowledging their opt-in and informing them of their communication rights. Opt-in records including phone number and timestamp are stored securely. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
+
+    '<h2>Opt-Out</h2>' +
+    '<p>Users may opt out at any time by replying STOP. Once opted out, no further messages will be sent unless the user re-initiates contact by replying START or UNSTOP.</p>' +
 
     '<h2>Contact</h2>' +
     '<p>For questions, contact wyattmorgan@tenant-flow-ai.com.</p>' +
@@ -123,7 +247,9 @@ app.get("/privacy", (req, res) => {
   );
 });
 
-// Terms and Conditions page
+// ─────────────────────────────────────────────
+// TERMS & CONDITIONS
+// ─────────────────────────────────────────────
 app.get("/terms", (req, res) => {
   res.status(200).send(
     '<html><head><title>Terms and Conditions</title><style>body { font-family: Arial, sans-serif; background: #f5f7fb; padding: 40px; color: #333; max-width: 900px; margin: auto; line-height: 1.7; } h1 { font-size: 36px; margin-bottom: 20px; } h2 { font-size: 24px; margin-top: 30px; } p { font-size: 18px; margin-bottom: 15px; }</style></head><body>' +
@@ -136,19 +262,19 @@ app.get("/terms", (req, res) => {
     '<p>Tenant Flow AI provides SMS-based communication for maintenance requests, scheduling updates, issue resolution, and property management communication between tenants, property managers, and maintenance personnel.</p>' +
 
     '<h2>Consent to Receive Messages</h2>' +
-    '<p>Users consent to receive messages by sending the first text message to Tenant Flow AI to report a maintenance issue or communicate with property management.</p>' +
+    '<p>Users consent to receive messages by sending the first text message to Tenant Flow AI. Upon first contact, users receive an automated opt-in confirmation message. Opt-in is recorded with a timestamp. Users may re-opt in at any time by replying START or UNSTOP.</p>' +
 
     '<h2>Message Frequency</h2>' +
     '<p>Message frequency varies depending on maintenance activity, scheduling updates, and communication needs.</p>' +
 
     '<h2>Fees</h2>' +
-    '<p>Message and data rates may apply depending on the user’s mobile carrier and messaging plan.</p>' +
+    '<p>Message and data rates may apply depending on the user\'s mobile carrier and messaging plan.</p>' +
 
     '<h2>Opt-Out</h2>' +
-    '<p>Users may opt out at any time by replying STOP.</p>' +
+    '<p>Users may opt out at any time by replying STOP. No further messages will be sent after opting out.</p>' +
 
     '<h2>Help</h2>' +
-    '<p>Users may reply HELP for assistance.</p>' +
+    '<p>Users may reply HELP for assistance. A help message with program details and support contact will be returned.</p>' +
 
     '<h2>Support Contact</h2>' +
     '<p>For support, contact wyattmorgan@tenant-flow-ai.com.</p>' +
@@ -157,7 +283,9 @@ app.get("/terms", (req, res) => {
   );
 });
 
-// Fallback
+// ─────────────────────────────────────────────
+// 404 FALLBACK
+// ─────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).send("Not Found: " + req.method + " " + req.path);
 });
