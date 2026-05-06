@@ -38,12 +38,12 @@ function recordOptOut(phone) {
 const OPT_IN_CONFIRMATION =
   "Welcome to Tenant Flow AI! By texting this number you consent to receive " +
   "conversational SMS messages for maintenance requests, scheduling updates, and " +
-  "property management communication. Msg frequency varies. Msg & data rates may " +
+  "property management communication. Msg frequency varies. Msg and data rates may " +
   "apply. Reply STOP to opt out at any time or HELP for assistance.";
 
 const HELP_REPLY =
   "Tenant Flow AI Help: Text us to report maintenance issues and we will route " +
-  "your request to the right person. Msg & data rates may apply. Reply STOP to " +
+  "your request to the right person. Msg and data rates may apply. Reply STOP to " +
   "opt out. Support: wyattmorgan@tenant-flow-ai.com";
 
 // Keywords Twilio auto-handles for STOP, but we log them ourselves too
