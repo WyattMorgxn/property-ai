@@ -2,14 +2,10 @@ import express from "express";
 import nodemailer from "nodemailer";
 
 const app = express();
-
-// Twilio sends form-encoded data
 app.use(express.urlencoded({ extended: false }));
 
 // ─────────────────────────────────────────────
 // PROPERTY LOOKUP TABLE
-// Maps tenant phone number → property info + manager contact
-// Add new tenants here as you onboard them
 // ─────────────────────────────────────────────
 const PROPERTIES = {
   "+19377033507": {
@@ -18,7 +14,7 @@ const PROPERTIES = {
     managerPhone: "+14192964656",
     managerEmail: "Morgaw23@gmail.com",
   },
-  // Add more tenants below like this:
+  // Add more tenants here:
   // "+1XXXXXXXXXX": {
   //   address: "123 Main St Cincinnati OH 45000",
   //   managerName: "Wyatt Morgan",
@@ -27,7 +23,6 @@ const PROPERTIES = {
   // },
 };
 
-// Default manager (used if tenant is not in the lookup table)
 const DEFAULT_MANAGER = {
   managerName: "Wyatt Morgan",
   managerPhone: "+14192964656",
@@ -37,6 +32,39 @@ const DEFAULT_MANAGER = {
 
 function getProperty(tenantPhone) {
   return PROPERTIES[tenantPhone] || { ...DEFAULT_MANAGER };
+}
+
+// ─────────────────────────────────────────────
+// CONVERSATION MEMORY
+// Stores full chat history per tenant so Claude
+// remembers the whole back-and-forth
+// ─────────────────────────────────────────────
+const conversations = new Map(); // phone → { messages: [], resolved: bool }
+
+function getConversation(phone) {
+  if (!conversations.has(phone)) {
+    conversations.set(phone, { messages: [], resolved: false });
+  }
+  return conversations.get(phone);
+}
+
+function addMessage(phone, role, content) {
+  const convo = getConversation(phone);
+  convo.messages.push({ role, content });
+}
+
+function markResolved(phone) {
+  const convo = getConversation(phone);
+  convo.resolved = true;
+  // Reset after 24 hours so tenant can submit a new request
+  setTimeout(() => {
+    conversations.delete(phone);
+    console.log(`[CONVO RESET] ${phone} conversation cleared after 24hrs`);
+  }, 24 * 60 * 60 * 1000);
+}
+
+function isResolved(phone) {
+  return getConversation(phone).resolved;
 }
 
 // ─────────────────────────────────────────────
@@ -64,7 +92,7 @@ function recordOptOut(phone) {
 }
 
 // ─────────────────────────────────────────────
-// COMPLIANCE MESSAGE TEMPLATES
+// COMPLIANCE MESSAGES
 // ─────────────────────────────────────────────
 const OPT_IN_CONFIRMATION =
   "Welcome to Tenant Flow AI! By texting this number you consent to receive " +
@@ -88,48 +116,37 @@ const TWILIO_AUTH_TOKEN   = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 
 async function sendSms(to, message) {
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
+  const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
   const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
   const body = new URLSearchParams({ To: to, From: TWILIO_PHONE_NUMBER, Body: message });
 
   const response = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
+    headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
     body: body.toString(),
   });
 
   const data = await response.json();
-  if (!response.ok) {
-    console.error("[TWILIO ERROR]", data);
-  } else {
-    console.log(`[SMS SENT] to ${to}`);
-  }
+  if (!response.ok) console.error("[TWILIO ERROR]", data);
+  else console.log(`[SMS SENT] to ${to}`);
 }
 
 // ─────────────────────────────────────────────
-// EMAIL (nodemailer via Gmail)
+// EMAIL
 // ─────────────────────────────────────────────
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
-  auth: {
-    user: GMAIL_USER,
-    pass: GMAIL_PASS,
-  },
+  auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
 async function sendEmail(to, subject, body) {
   try {
     await transporter.sendMail({
       from: `"Tenant Flow AI" <${GMAIL_USER}>`,
-      to,
-      subject,
-      text: body,
+      to, subject, text: body,
     });
     console.log(`[EMAIL SENT] to ${to}: ${subject}`);
   } catch (err) {
@@ -138,30 +155,31 @@ async function sendEmail(to, subject, body) {
 }
 
 // ─────────────────────────────────────────────
-// NOTIFY PROPERTY MANAGER (SMS + Email)
+// NOTIFY MANAGER (SMS + Email)
 // ─────────────────────────────────────────────
-async function notifyManager(tenantPhone, tenantMessage, claudeReply, urgency) {
+async function notifyManager(tenantPhone, summary, urgency, availability) {
   const property = getProperty(tenantPhone);
 
   const smsMessage =
-    `TENANT FLOW AI ALERT\n` +
+    `TENANT FLOW AI - NEW REQUEST\n` +
     `Property: ${property.address}\n` +
     `Tenant: ${tenantPhone}\n` +
     `Urgency: ${urgency}\n` +
-    `Issue: ${tenantMessage}`;
+    `Availability: ${availability}\n` +
+    `Issue: ${summary}`;
 
   const emailBody =
-    `New Maintenance Request\n\n` +
+    `New Maintenance Request - Ready to Schedule\n\n` +
     `Property: ${property.address}\n` +
     `Tenant Phone: ${tenantPhone}\n` +
-    `Urgency: ${urgency}\n\n` +
-    `Tenant Message:\n${tenantMessage}\n\n` +
-    `AI Response Sent to Tenant:\n${claudeReply}\n\n` +
+    `Urgency: ${urgency}\n` +
+    `Tenant Availability: ${availability}\n\n` +
+    `Issue Summary:\n${summary}\n\n` +
+    `Next Step: Contact the tenant to confirm the appointment.\n\n` +
     `---\nTenant Flow AI`;
 
-  const emailSubject = `[${urgency}] Maintenance Request - ${property.address}`;
+  const emailSubject = `[${urgency}] New Request - ${property.address}`;
 
-  // Send both SMS and email to manager
   await Promise.all([
     sendSms(property.managerPhone, smsMessage),
     sendEmail(property.managerEmail, emailSubject, emailBody),
@@ -169,45 +187,55 @@ async function notifyManager(tenantPhone, tenantMessage, claudeReply, urgency) {
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE AI
+// CLAUDE AI WITH CONVERSATION MEMORY
 // ─────────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-const SYSTEM_PROMPT = `You are Tenant Flow AI, a helpful property management assistant.
-Your job is to help tenants report maintenance issues and get help quickly.
+const SYSTEM_PROMPT = `You are Tenant Flow AI, a friendly property management assistant that helps tenants submit maintenance requests via SMS.
 
-When a tenant texts you:
-1. Acknowledge their issue warmly and professionally
-2. Classify the urgency as one of: EMERGENCY (gas leak, flooding, no heat in winter, electrical hazard), URGENT (no hot water, broken lock, major appliance failure), or ROUTINE (minor repairs, cosmetic issues)
-3. Let them know what happens next
-4. Keep your response concise - this is SMS so aim for 2-3 sentences max
-5. Always end with "Reply STOP to opt out or HELP for assistance."
+Your goal is to collect all the information needed to schedule a repair in as few messages as possible (ideally 2-3 exchanges max). Keep messages short and conversational since this is SMS.
 
-For EMERGENCY issues, say a property manager has been alerted immediately.
-For URGENT issues, say someone will follow up within a few hours.
-For ROUTINE issues, say it will be scheduled within 1-2 business days.
+CONVERSATION FLOW:
+1. When a tenant first describes an issue, acknowledge it and ask ONLY the most important missing info (usually just their availability).
+2. Once you have the issue description AND availability, confirm everything and tell them they are all set.
+3. Do NOT ask multiple questions at once. One question per message maximum.
 
-IMPORTANT: At the very end of your response, on a new line, write exactly:
-URGENCY: EMERGENCY
-or
-URGENCY: URGENT
-or
-URGENCY: ROUTINE
+URGENCY LEVELS:
+- EMERGENCY: gas leak, flooding, no heat in winter, electrical hazard, fire → tell them you are alerting someone immediately
+- URGENT: no hot water, broken lock, major appliance failure → follow up within a few hours
+- ROUTINE: minor repairs, cosmetic issues → scheduled within 1-2 business days
 
-This line will be stripped before sending to the tenant.`;
+WHEN YOU HAVE ENOUGH INFO (issue + availability):
+- Send a warm confirmation like "You are all set! We have logged your request and a technician will reach out shortly to confirm your appointment. Reply STOP to opt out or HELP for assistance."
+- On the LAST line of your response write exactly: RESOLVED|URGENCY:<level>|SUMMARY:<one sentence summary>|AVAILABILITY:<their availability>
+- Example: RESOLVED|URGENCY:ROUTINE|SUMMARY:Leaking kitchen sink|AVAILABILITY:Weekdays after 3pm
 
-function parseUrgency(text) {
-  const match = text.match(/URGENCY:\s*(EMERGENCY|URGENT|ROUTINE)/i);
-  return match ? match[1].toUpperCase() : "ROUTINE";
+For EMERGENCY situations, skip asking about availability and resolve immediately with RESOLVED|URGENCY:EMERGENCY|SUMMARY:<issue>|AVAILABILITY:ASAP
+
+Always be warm, brief, and professional. Never make up technician names or exact times.`;
+
+function parseResolution(text) {
+  const match = text.match(/RESOLVED\|URGENCY:(\w+)\|SUMMARY:([^|]+)\|AVAILABILITY:(.+)/);
+  if (!match) return null;
+  return {
+    urgency: match[1].toUpperCase(),
+    summary: match[2].trim(),
+    availability: match[3].trim(),
+  };
 }
 
-function stripUrgencyLine(text) {
-  return text.replace(/\nURGENCY:\s*(EMERGENCY|URGENT|ROUTINE)/i, "").trim();
+function stripResolutionLine(text) {
+  return text.replace(/\nRESOLVED\|URGENCY:[^\n]+/g, "").trim();
 }
 
 async function processWithClaude(tenantPhone, message) {
   try {
-    console.log(`[CLAUDE] Processing from ${tenantPhone}: ${message}`);
+    // Add tenant message to conversation history
+    addMessage(tenantPhone, "user", message);
+
+    const convo = getConversation(tenantPhone);
+
+    console.log(`[CLAUDE] Processing from ${tenantPhone} (${convo.messages.length} messages in history)`);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -218,9 +246,9 @@ async function processWithClaude(tenantPhone, message) {
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 300,
+        max_tokens: 400,
         system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: message }],
+        messages: convo.messages,
       }),
     });
 
@@ -229,28 +257,35 @@ async function processWithClaude(tenantPhone, message) {
     if (!response.ok) {
       console.error("[CLAUDE ERROR]", data);
       await sendSms(tenantPhone,
-        "Tenant Flow AI: We received your maintenance request and will follow up shortly. " +
+        "Tenant Flow AI: We received your message and will follow up shortly. " +
         "Reply STOP to opt out or HELP for assistance."
       );
       return;
     }
 
-    const rawReply = data.content[0].text;
-    const urgency  = parseUrgency(rawReply);
-    const reply    = stripUrgencyLine(rawReply);
+    const rawReply   = data.content[0].text;
+    const resolution = parseResolution(rawReply);
+    const reply      = stripResolutionLine(rawReply);
 
-    console.log(`[CLAUDE REPLY] Urgency: ${urgency} | ${reply}`);
+    // Save Claude's reply to conversation history
+    addMessage(tenantPhone, "assistant", rawReply);
+
+    console.log(`[CLAUDE REPLY] ${reply}`);
 
     // Send reply to tenant
     await sendSms(tenantPhone, reply);
 
-    // Notify property manager via SMS + email
-    await notifyManager(tenantPhone, message, reply, urgency);
+    // If Claude has collected everything, notify the manager
+    if (resolution) {
+      console.log(`[RESOLVED] ${tenantPhone} | ${resolution.urgency} | ${resolution.summary}`);
+      markResolved(tenantPhone);
+      await notifyManager(tenantPhone, resolution.summary, resolution.urgency, resolution.availability);
+    }
 
   } catch (err) {
     console.error("[CLAUDE EXCEPTION]", err);
     await sendSms(tenantPhone,
-      "Tenant Flow AI: We received your maintenance request and will follow up shortly. " +
+      "Tenant Flow AI: We received your message and will follow up shortly. " +
       "Reply STOP to opt out or HELP for assistance."
     );
   }
@@ -260,10 +295,7 @@ async function processWithClaude(tenantPhone, message) {
 // HELPERS
 // ─────────────────────────────────────────────
 function twimlResponse(message) {
-  return (
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    "<Response><Message>" + message + "</Message></Response>"
-  );
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + message + '</Message></Response>';
 }
 
 function emptyTwiml() {
@@ -296,9 +328,9 @@ app.get("/", (req, res) => {
     '</style></head><body>' +
     '<h1>Tenant Flow AI</h1>' +
     '<p>AI-powered tenant maintenance communication platform for property managers.</p>' +
-    '<p>Tenants can report maintenance issues via SMS. The system acknowledges requests, classifies urgency, and notifies property management staff.</p>' +
+    '<p>Tenants can report maintenance issues via SMS. The system acknowledges requests, classifies urgency, collects availability, and notifies the property manager automatically.</p>' +
     '<p class="section-title">How It Works</p>' +
-    '<p>Tenants send a text message describing an issue. Tenant Flow AI processes the request, categorizes urgency, notifies the appropriate property manager via SMS and email, and sends updates back to the tenant.</p>' +
+    '<p>Tenants send a text message describing an issue. Tenant Flow AI collects all necessary details, then sends a complete summary to the property manager via SMS and email so they can schedule the repair.</p>' +
     '<p class="section-title">How to Get Started</p>' +
     '<p>Text the Tenant Flow AI phone number to report a maintenance issue. By sending the first message, you agree to receive conversational SMS responses. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
     '<p class="section-title">SMS Consent and Compliance</p>' +
@@ -331,6 +363,7 @@ app.post("/sms", (req, res) => {
   // 1. STOP
   if (STOP_KEYWORDS.has(keyword)) {
     recordOptOut(from);
+    conversations.delete(from);
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
 
@@ -351,13 +384,19 @@ app.post("/sms", (req, res) => {
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
 
-  // 5. First-time texter
+  // 5. First-time texter — send opt-in confirmation
   if (isFirstTimeTexter(from)) {
     recordOptIn(from);
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(OPT_IN_CONFIRMATION));
   }
 
-  // 6. Returning opted-in tenant — process with Claude + notify manager
+  // 6. Already resolved — start fresh
+  if (isResolved(from)) {
+    conversations.delete(from);
+    console.log(`[NEW REQUEST] ${from} starting a new request after resolution.`);
+  }
+
+  // 7. Process with Claude (with full conversation memory)
   console.log(`[PROCESSING] from ${from}: ${body}`);
   res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   processWithClaude(from, body);
