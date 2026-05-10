@@ -29,8 +29,43 @@ async function initDb() {
       resolved BOOLEAN DEFAULT false,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS requests (
+      id SERIAL PRIMARY KEY,
+      tenant_phone TEXT,
+      address TEXT,
+      summary TEXT,
+      urgency TEXT,
+      availability TEXT,
+      category TEXT,
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   console.log("[DB] Tables ready");
+}
+
+async function saveRequest(tenantPhone, address, summary, urgency, availability, category) {
+  const res = await pool.query(`
+    INSERT INTO requests (tenant_phone, address, summary, urgency, availability, category, status)
+    VALUES ($1, $2, $3, $4, $5, $6, 'active')
+    RETURNING id
+  `, [tenantPhone, address, summary, urgency, availability, category]);
+  return res.rows[0].id;
+}
+
+async function updateRequestStatus(address, status) {
+  await pool.query(`
+    UPDATE requests SET status = $1, updated_at = NOW()
+    WHERE LOWER(address) LIKE $2 AND status = 'active'
+  `, [status, `%${address.toLowerCase()}%`]);
+}
+
+async function getAllRequests() {
+  const res = await pool.query(`
+    SELECT * FROM requests ORDER BY created_at DESC
+  `);
+  return res.rows;
 }
 
 // Tenant profile functions
@@ -56,10 +91,7 @@ async function hasAddress(phone) {
 }
 
 async function saveAddress(phone, address) {
-  await pool.query(
-    "UPDATE tenants SET address = $1 WHERE phone = $2",
-    [address, phone]
-  );
+  await pool.query("UPDATE tenants SET address = $1 WHERE phone = $2", [address, phone]);
   console.log(`[PROFILE SAVED] ${phone} → ${address}`);
 }
 
@@ -79,14 +111,10 @@ async function recordOptIn(phone) {
 }
 
 async function recordOptOut(phone) {
-  await pool.query(
-    "UPDATE tenants SET opted_out = true WHERE phone = $1",
-    [phone]
-  );
+  await pool.query("UPDATE tenants SET opted_out = true WHERE phone = $1", [phone]);
   console.log(`[OPT-OUT] ${phone}`);
 }
 
-// Look up tenant by address (for maintenance replies)
 async function getTenantByAddress(addressFragment) {
   const res = await pool.query(
     "SELECT * FROM tenants WHERE LOWER(address) LIKE $1 AND opted_out = false",
@@ -97,37 +125,22 @@ async function getTenantByAddress(addressFragment) {
 
 // Conversation functions
 async function getConversation(phone) {
-  const res = await pool.query(
-    "SELECT * FROM conversations WHERE phone = $1",
-    [phone]
-  );
+  const res = await pool.query("SELECT * FROM conversations WHERE phone = $1", [phone]);
   if (res.rows[0]) return res.rows[0];
-  await pool.query(
-    "INSERT INTO conversations (phone, messages, resolved) VALUES ($1, '[]', false)",
-    [phone]
-  );
+  await pool.query("INSERT INTO conversations (phone, messages, resolved) VALUES ($1, '[]', false)", [phone]);
   return { phone, messages: [], resolved: false };
 }
 
 async function addMessage(phone, role, content) {
   await pool.query(`
-    UPDATE conversations
-    SET messages = messages || $1::jsonb, updated_at = NOW()
-    WHERE phone = $2
+    UPDATE conversations SET messages = messages || $1::jsonb, updated_at = NOW() WHERE phone = $2
   `, [JSON.stringify([{ role, content }]), phone]);
 }
 
 async function markResolved(phone) {
-  await pool.query(
-    "UPDATE conversations SET resolved = true, updated_at = NOW() WHERE phone = $1",
-    [phone]
-  );
-  // Reset after 24 hours
+  await pool.query("UPDATE conversations SET resolved = true, updated_at = NOW() WHERE phone = $1", [phone]);
   setTimeout(async () => {
-    await pool.query(
-      "UPDATE conversations SET messages = '[]', resolved = false WHERE phone = $1",
-      [phone]
-    );
+    await pool.query("UPDATE conversations SET messages = '[]', resolved = false WHERE phone = $1", [phone]);
     console.log(`[CONVO RESET] ${phone}`);
   }, 24 * 60 * 60 * 1000);
 }
@@ -138,15 +151,11 @@ async function isResolved(phone) {
 }
 
 async function clearConversation(phone) {
-  await pool.query(
-    "UPDATE conversations SET messages = '[]', resolved = false WHERE phone = $1",
-    [phone]
-  );
+  await pool.query("UPDATE conversations SET messages = '[]', resolved = false WHERE phone = $1", [phone]);
 }
 
 // ─────────────────────────────────────────────
 // MAINTENANCE CONTACTS
-// Update phone numbers here when you get real contacts
 // ─────────────────────────────────────────────
 const MAINTENANCE_CONTACTS = {
   plumbing: {
@@ -191,10 +200,7 @@ const MAINTENANCE_CONTACTS = {
   },
 };
 
-// All maintenance phone numbers (to detect if a text is from a maintenance person)
-const MAINTENANCE_PHONES = new Set(
-  Object.values(MAINTENANCE_CONTACTS).map(c => c.phone)
-);
+const MAINTENANCE_PHONES = new Set(Object.values(MAINTENANCE_CONTACTS).map(c => c.phone));
 
 function getMaintenanceContact(summary) {
   const lowerSummary = summary.toLowerCase();
@@ -209,8 +215,6 @@ function getMaintenanceContact(summary) {
 
 // ─────────────────────────────────────────────
 // MAINTENANCE REPLY HANDLER
-// Detects status updates from maintenance staff
-// Format: "Done 111 Woodlawn Lima Ohio"
 // ─────────────────────────────────────────────
 const STATUS_KEYWORDS = {
   done:        ["done", "completed", "complete", "finished", "fixed", "resolved"],
@@ -222,78 +226,57 @@ const STATUS_KEYWORDS = {
 function detectStatusKeyword(body) {
   const lower = body.toLowerCase();
   for (const [status, keywords] of Object.entries(STATUS_KEYWORDS)) {
-    if (keywords.some(k => lower.startsWith(k))) {
-      return status;
-    }
+    if (keywords.some(k => lower.startsWith(k))) return status;
   }
   return null;
 }
 
 function extractAddress(body) {
-  // Remove the first word (the status keyword) and return the rest as the address
-  const parts = body.trim().split(/\s+/);
-  // Handle two-word keywords like "on my way"
   for (const keywords of Object.values(STATUS_KEYWORDS)) {
     for (const kw of keywords) {
-      if (body.toLowerCase().startsWith(kw)) {
-        return body.slice(kw.length).trim();
-      }
+      if (body.toLowerCase().startsWith(kw)) return body.slice(kw.length).trim();
     }
   }
-  return parts.slice(1).join(" ").trim();
+  return body.trim().split(/\s+/).slice(1).join(" ").trim();
 }
 
 async function handleMaintenanceReply(from, body) {
   const status = detectStatusKeyword(body);
 
   if (!status) {
-    // Not a recognized status update — just acknowledge
     await sendSms(from,
-      "Tenant Flow AI: Message received. To update a job status, text: " +
-      "Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>."
+      "Tenant Flow AI: To update a job, text: Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>."
     );
     return;
   }
 
   const address = extractAddress(body);
-
   if (!address) {
-    await sendSms(from,
-      "Please include the property address. Example: Done 111 Woodlawn Lima Ohio"
-    );
+    await sendSms(from, "Please include the property address. Example: Done 111 Woodlawn Lima Ohio");
     return;
   }
 
-  // Look up tenant by address
   const tenant = await getTenantByAddress(address);
-
   if (!tenant) {
-    console.log(`[MAINTENANCE REPLY] No tenant found for address: ${address}`);
     await sendSms(from, `Could not find a tenant at "${address}". Please check the address and try again.`);
     return;
   }
 
   console.log(`[MAINTENANCE REPLY] Status: ${status} | Address: ${address} | Tenant: ${tenant.phone}`);
 
-  // Send the right message to the tenant based on status
-  let tenantMessage = "";
+  // Update request status in database
+  const dbStatus = status === "done" ? "completed" : status === "onmyway" ? "active" : status;
+  await updateRequestStatus(address, dbStatus);
 
+  let tenantMessage = "";
   if (status === "done") {
-    tenantMessage =
-      `Good news! Your maintenance issue at ${tenant.address} has been resolved. ` +
-      `Please reply if you have any further concerns. Reply STOP to opt out or HELP for assistance.`;
+    tenantMessage = `Good news! Your maintenance issue at ${tenant.address} has been resolved. Reply if you have any further concerns. Reply STOP to opt out or HELP for assistance.`;
   } else if (status === "scheduled") {
-    tenantMessage =
-      `Your maintenance appointment at ${tenant.address} has been scheduled. ` +
-      `Your technician will contact you directly to confirm the exact time. Reply STOP to opt out or HELP for assistance.`;
+    tenantMessage = `Your maintenance appointment at ${tenant.address} has been scheduled. Your technician will contact you directly to confirm the exact time. Reply STOP to opt out or HELP for assistance.`;
   } else if (status === "onmyway") {
-    tenantMessage =
-      `Your technician is on the way to ${tenant.address}! ` +
-      `Please make sure someone is available to let them in. Reply STOP to opt out or HELP for assistance.`;
+    tenantMessage = `Your technician is on the way to ${tenant.address}! Please make sure someone is available to let them in. Reply STOP to opt out or HELP for assistance.`;
   } else if (status === "unavailable") {
-    tenantMessage =
-      `We are working on rescheduling your maintenance visit at ${tenant.address}. ` +
-      `We will follow up shortly with a new time. We apologize for the inconvenience. Reply STOP to opt out or HELP for assistance.`;
+    tenantMessage = `We are working on rescheduling your maintenance visit at ${tenant.address}. We will follow up shortly with a new time. Reply STOP to opt out or HELP for assistance.`;
   }
 
   await sendSms(tenant.phone, tenantMessage);
@@ -328,13 +311,11 @@ async function sendSms(to, message) {
   const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
   const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
   const body = new URLSearchParams({ To: to, From: TWILIO_PHONE_NUMBER, Body: message });
-
   const response = await fetch(url, {
     method: "POST",
     headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
     body: body.toString(),
   });
-
   const data = await response.json();
   if (!response.ok) console.error("[TWILIO ERROR]", data);
   else console.log(`[SMS SENT] to ${to}`);
@@ -346,30 +327,20 @@ async function sendSms(to, message) {
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
 
-console.log("[EMAIL CONFIG] User:", GMAIL_USER);
-console.log("[EMAIL CONFIG] Pass length:", GMAIL_PASS ? GMAIL_PASS.length : "NOT SET");
-
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 587,
   secure: false,
-  auth: {
-    user: GMAIL_USER,
-    pass: GMAIL_PASS,
-  },
+  auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-transporter.verify(function (error, success) {
-  if (error) {
-    console.error("[EMAIL VERIFY ERROR]", error.message);
-  } else {
-    console.log("[EMAIL READY] Gmail connection verified");
-  }
+transporter.verify(function (error) {
+  if (error) console.error("[EMAIL VERIFY ERROR]", error.message);
+  else console.log("[EMAIL READY] Gmail connection verified");
 });
 
 async function sendEmail(to, subject, body) {
   try {
-    console.log(`[EMAIL ATTEMPTING] to ${to}`);
     const info = await transporter.sendMail({
       from: `"Tenant Flow AI" <${GMAIL_USER}>`,
       to, subject, text: body,
@@ -377,7 +348,6 @@ async function sendEmail(to, subject, body) {
     console.log(`[EMAIL SENT] to ${to} | ID: ${info.messageId}`);
   } catch (err) {
     console.error("[EMAIL ERROR]", err.message);
-    console.error("[EMAIL ERROR CODE]", err.code);
   }
 }
 
@@ -386,6 +356,8 @@ async function sendEmail(to, subject, body) {
 // ─────────────────────────────────────────────
 async function notifyMaintenance(tenantPhone, summary, urgency, availability, address) {
   const contact = getMaintenanceContact(summary);
+
+  await saveRequest(tenantPhone, address, summary, urgency, availability, contact.category);
 
   const smsMessage =
     `TENANT FLOW AI - NEW JOB\n` +
@@ -417,7 +389,7 @@ async function notifyMaintenance(tenantPhone, summary, urgency, availability, ad
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE AI WITH CONVERSATION MEMORY
+// CLAUDE AI
 // ─────────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
@@ -468,7 +440,6 @@ async function processWithClaude(tenantPhone, message) {
   try {
     await addMessage(tenantPhone, "user", message);
     const convo = await getConversation(tenantPhone);
-
     console.log(`[CLAUDE] ${tenantPhone} (${convo.messages.length} msgs)`);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -490,10 +461,7 @@ async function processWithClaude(tenantPhone, message) {
 
     if (!response.ok) {
       console.error("[CLAUDE ERROR]", data);
-      await sendSms(tenantPhone,
-        "Tenant Flow AI: We received your message and will follow up shortly. " +
-        "Reply STOP to opt out or HELP for assistance."
-      );
+      await sendSms(tenantPhone, "Tenant Flow AI: We received your message and will follow up shortly. Reply STOP to opt out or HELP for assistance.");
       return;
     }
 
@@ -510,21 +478,12 @@ async function processWithClaude(tenantPhone, message) {
       }
       console.log(`[RESOLVED] ${tenantPhone} | ${resolution.urgency} | ${resolution.summary}`);
       await markResolved(tenantPhone);
-      await notifyMaintenance(
-        tenantPhone,
-        resolution.summary,
-        resolution.urgency,
-        resolution.availability,
-        resolution.address
-      );
+      await notifyMaintenance(tenantPhone, resolution.summary, resolution.urgency, resolution.availability, resolution.address);
     }
 
   } catch (err) {
     console.error("[CLAUDE EXCEPTION]", err);
-    await sendSms(tenantPhone,
-      "Tenant Flow AI: We received your message and will follow up shortly. " +
-      "Reply STOP to opt out or HELP for assistance."
-    );
+    await sendSms(tenantPhone, "Tenant Flow AI: We received your message and will follow up shortly. Reply STOP to opt out or HELP for assistance.");
   }
 }
 
@@ -539,12 +498,150 @@ function emptyTwiml() {
   return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
 
+function urgencyColor(urgency) {
+  if (urgency === "EMERGENCY") return "#ef4444";
+  if (urgency === "URGENT") return "#f97316";
+  return "#22c55e";
+}
+
+function statusColor(status) {
+  if (status === "completed") return "#22c55e";
+  if (status === "scheduled") return "#3b82f6";
+  if (status === "unavailable") return "#ef4444";
+  return "#f97316";
+}
+
+function timeAgo(date) {
+  const seconds = Math.floor((new Date() - new Date(date)) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
 // ─────────────────────────────────────────────
 // LOGGING MIDDLEWARE
 // ─────────────────────────────────────────────
 app.use((req, res, next) => {
   console.log("[" + new Date().toISOString() + "] " + req.method + " " + req.path);
   next();
+});
+
+// ─────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────
+app.get("/dashboard", async (req, res) => {
+  const filter = req.query.filter || "all";
+  let requests = await getAllRequests();
+
+  if (filter === "active") requests = requests.filter(r => r.status === "active");
+  if (filter === "completed") requests = requests.filter(r => r.status === "completed");
+  if (filter === "scheduled") requests = requests.filter(r => r.status === "scheduled");
+
+  const total     = requests.length;
+  const active    = requests.filter(r => r.status === "active").length;
+  const completed = requests.filter(r => r.status === "completed").length;
+  const emergency = requests.filter(r => r.urgency === "EMERGENCY").length;
+
+  const rows = requests.map(r => `
+    <tr>
+      <td>${timeAgo(r.created_at)}</td>
+      <td>${r.address || "Unknown"}</td>
+      <td>${r.tenant_phone}</td>
+      <td><span style="background:${urgencyColor(r.urgency)};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${r.urgency}</span></td>
+      <td>${r.category}</td>
+      <td>${r.summary}</td>
+      <td>${r.availability}</td>
+      <td><span style="background:${statusColor(r.status)};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${r.status}</span></td>
+    </tr>
+  `).join("");
+
+  res.status(200).send(`
+    <html>
+    <head>
+      <title>Tenant Flow AI — Dashboard</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; background: #f1f5f9; color: #1e293b; }
+        .header { background: #1e293b; color: white; padding: 20px 32px; display: flex; align-items: center; justify-content: space-between; }
+        .header h1 { font-size: 22px; }
+        .header span { font-size: 14px; color: #94a3b8; }
+        .stats { display: flex; gap: 16px; padding: 24px 32px; flex-wrap: wrap; }
+        .stat { background: white; border-radius: 12px; padding: 20px 24px; flex: 1; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        .stat .num { font-size: 32px; font-weight: bold; }
+        .stat .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+        .stat.emergency .num { color: #ef4444; }
+        .stat.active .num { color: #f97316; }
+        .stat.completed .num { color: #22c55e; }
+        .filters { padding: 0 32px 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+        .filters a { padding: 8px 16px; border-radius: 20px; text-decoration: none; font-size: 13px; font-weight: bold; background: white; color: #64748b; border: 2px solid transparent; }
+        .filters a.active { background: #1e293b; color: white; }
+        .table-wrap { padding: 0 32px 32px; overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        th { background: #f8fafc; text-align: left; padding: 12px 16px; font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #e2e8f0; }
+        td { padding: 14px 16px; font-size: 14px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: #f8fafc; }
+        .empty { text-align: center; padding: 60px; color: #94a3b8; font-size: 16px; }
+        .refresh { font-size: 13px; color: #94a3b8; }
+      </style>
+      <meta http-equiv="refresh" content="30">
+    </head>
+    <body>
+      <div class="header">
+        <h1>Tenant Flow AI Dashboard</h1>
+        <span class="refresh">Auto-refreshes every 30 seconds</span>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="num">${total}</div>
+          <div class="label">Total Requests</div>
+        </div>
+        <div class="stat active">
+          <div class="num">${active}</div>
+          <div class="label">Active</div>
+        </div>
+        <div class="stat completed">
+          <div class="num">${completed}</div>
+          <div class="label">Completed</div>
+        </div>
+        <div class="stat emergency">
+          <div class="num">${emergency}</div>
+          <div class="label">Emergencies</div>
+        </div>
+      </div>
+
+      <div class="filters">
+        <a href="/dashboard?filter=all" class="${filter === "all" ? "active" : ""}">All</a>
+        <a href="/dashboard?filter=active" class="${filter === "active" ? "active" : ""}">Active</a>
+        <a href="/dashboard?filter=completed" class="${filter === "completed" ? "active" : ""}">Completed</a>
+        <a href="/dashboard?filter=scheduled" class="${filter === "scheduled" ? "active" : ""}">Scheduled</a>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Property</th>
+              <th>Tenant</th>
+              <th>Urgency</th>
+              <th>Category</th>
+              <th>Issue</th>
+              <th>Availability</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows || '<tr><td colspan="8" class="empty">No requests found</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </body>
+    </html>
+  `);
 });
 
 // ─────────────────────────────────────────────
@@ -575,7 +672,7 @@ app.get("/", (req, res) => {
     '<p class="owner">Tenant Flow AI is owned and operated by Wyatt D Morgan.</p>' +
     '<p>Business Location: United States</p><p>Service Type: Property Management Communication Software</p>' +
     '<p class="contact">Contact: wyattmorgan@tenant-flow-ai.com</p>' +
-    '<div class="links"><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms and Conditions</a></div>' +
+    '<div class="links"><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms and Conditions</a> | <a href="/dashboard">Dashboard</a></div>' +
     '<footer>&copy; 2026 Tenant Flow AI</footer>' +
     '</body></html>'
   );
@@ -595,48 +692,41 @@ app.post("/sms", async (req, res) => {
 
   console.log("Incoming SMS from:", from, "| Message:", body);
 
-  // 1. STOP
   if (STOP_KEYWORDS.has(keyword)) {
     await recordOptOut(from);
     await clearConversation(from);
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
 
-  // 2. START / UNSTOP
   if (START_KEYWORDS.has(keyword)) {
     await recordOptIn(from);
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(OPT_IN_CONFIRMATION));
   }
 
-  // 3. HELP
   if (keyword === "HELP") {
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(HELP_REPLY));
   }
 
-  // 4. Check if this is a maintenance person replying with a status update
+  // Check if this is a maintenance person replying
   if (MAINTENANCE_PHONES.has(from)) {
     res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
     await handleMaintenanceReply(from, body);
     return;
   }
 
-  // 5. Opted-out
   if (await isOptedOut(from)) {
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
 
-  // 6. First-time texter — opt them in and send welcome
   if (await isFirstTimeTexter(from)) {
     await recordOptIn(from);
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(OPT_IN_CONFIRMATION));
   }
 
-  // 7. Already resolved — start fresh
   if (await isResolved(from)) {
     await clearConversation(from);
   }
 
-  // 8. Process with Claude
   res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   processWithClaude(from, body);
 });
@@ -657,8 +747,7 @@ app.get("/privacy", (req, res) => {
     '<p>Tenant Flow AI does not sell or share personal information with third parties for marketing purposes. Mobile numbers are never sold or shared.</p>' +
     '<h2>SMS Messaging and Opt-In</h2>' +
     '<p>Users opt in by sending the first text message to Tenant Flow AI. Upon first contact, users automatically receive a confirmation message. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
-    '<h2>Opt-Out</h2>' +
-    '<p>Users may opt out at any time by replying STOP.</p>' +
+    '<h2>Opt-Out</h2><p>Users may opt out at any time by replying STOP.</p>' +
     '<h2>Contact</h2><p>wyattmorgan@tenant-flow-ai.com</p>' +
     '</body></html>'
   );
