@@ -86,6 +86,15 @@ async function recordOptOut(phone) {
   console.log(`[OPT-OUT] ${phone}`);
 }
 
+// Look up tenant by address (for maintenance replies)
+async function getTenantByAddress(addressFragment) {
+  const res = await pool.query(
+    "SELECT * FROM tenants WHERE LOWER(address) LIKE $1 AND opted_out = false",
+    [`%${addressFragment.toLowerCase()}%`]
+  );
+  return res.rows[0] || null;
+}
+
 // Conversation functions
 async function getConversation(phone) {
   const res = await pool.query(
@@ -182,6 +191,11 @@ const MAINTENANCE_CONTACTS = {
   },
 };
 
+// All maintenance phone numbers (to detect if a text is from a maintenance person)
+const MAINTENANCE_PHONES = new Set(
+  Object.values(MAINTENANCE_CONTACTS).map(c => c.phone)
+);
+
 function getMaintenanceContact(summary) {
   const lowerSummary = summary.toLowerCase();
   for (const [category, contact] of Object.entries(MAINTENANCE_CONTACTS)) {
@@ -191,6 +205,99 @@ function getMaintenanceContact(summary) {
     }
   }
   return { category: "general", ...MAINTENANCE_CONTACTS.general };
+}
+
+// ─────────────────────────────────────────────
+// MAINTENANCE REPLY HANDLER
+// Detects status updates from maintenance staff
+// Format: "Done 111 Woodlawn Lima Ohio"
+// ─────────────────────────────────────────────
+const STATUS_KEYWORDS = {
+  done:        ["done", "completed", "complete", "finished", "fixed", "resolved"],
+  scheduled:   ["scheduled", "confirmed", "booked", "appointment set"],
+  onmyway:     ["on my way", "on the way", "heading over", "coming now", "be there"],
+  unavailable: ["unavailable", "cant make it", "can't make it", "rescheduling", "reschedule"],
+};
+
+function detectStatusKeyword(body) {
+  const lower = body.toLowerCase();
+  for (const [status, keywords] of Object.entries(STATUS_KEYWORDS)) {
+    if (keywords.some(k => lower.startsWith(k))) {
+      return status;
+    }
+  }
+  return null;
+}
+
+function extractAddress(body) {
+  // Remove the first word (the status keyword) and return the rest as the address
+  const parts = body.trim().split(/\s+/);
+  // Handle two-word keywords like "on my way"
+  for (const keywords of Object.values(STATUS_KEYWORDS)) {
+    for (const kw of keywords) {
+      if (body.toLowerCase().startsWith(kw)) {
+        return body.slice(kw.length).trim();
+      }
+    }
+  }
+  return parts.slice(1).join(" ").trim();
+}
+
+async function handleMaintenanceReply(from, body) {
+  const status = detectStatusKeyword(body);
+
+  if (!status) {
+    // Not a recognized status update — just acknowledge
+    await sendSms(from,
+      "Tenant Flow AI: Message received. To update a job status, text: " +
+      "Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>."
+    );
+    return;
+  }
+
+  const address = extractAddress(body);
+
+  if (!address) {
+    await sendSms(from,
+      "Please include the property address. Example: Done 111 Woodlawn Lima Ohio"
+    );
+    return;
+  }
+
+  // Look up tenant by address
+  const tenant = await getTenantByAddress(address);
+
+  if (!tenant) {
+    console.log(`[MAINTENANCE REPLY] No tenant found for address: ${address}`);
+    await sendSms(from, `Could not find a tenant at "${address}". Please check the address and try again.`);
+    return;
+  }
+
+  console.log(`[MAINTENANCE REPLY] Status: ${status} | Address: ${address} | Tenant: ${tenant.phone}`);
+
+  // Send the right message to the tenant based on status
+  let tenantMessage = "";
+
+  if (status === "done") {
+    tenantMessage =
+      `Good news! Your maintenance issue at ${tenant.address} has been resolved. ` +
+      `Please reply if you have any further concerns. Reply STOP to opt out or HELP for assistance.`;
+  } else if (status === "scheduled") {
+    tenantMessage =
+      `Your maintenance appointment at ${tenant.address} has been scheduled. ` +
+      `Your technician will contact you directly to confirm the exact time. Reply STOP to opt out or HELP for assistance.`;
+  } else if (status === "onmyway") {
+    tenantMessage =
+      `Your technician is on the way to ${tenant.address}! ` +
+      `Please make sure someone is available to let them in. Reply STOP to opt out or HELP for assistance.`;
+  } else if (status === "unavailable") {
+    tenantMessage =
+      `We are working on rescheduling your maintenance visit at ${tenant.address}. ` +
+      `We will follow up shortly with a new time. We apologize for the inconvenience. Reply STOP to opt out or HELP for assistance.`;
+  }
+
+  await sendSms(tenant.phone, tenantMessage);
+  await sendSms(from, `Got it! Tenant at ${tenant.address} has been notified.`);
 }
 
 // ─────────────────────────────────────────────
@@ -276,8 +383,6 @@ async function sendEmail(to, subject, body) {
 
 // ─────────────────────────────────────────────
 // NOTIFY MAINTENANCE PERSON
-// Routes to the right team based on issue type
-// Also sends email summary
 // ─────────────────────────────────────────────
 async function notifyMaintenance(tenantPhone, summary, urgency, availability, address) {
   const contact = getMaintenanceContact(summary);
@@ -290,7 +395,7 @@ async function notifyMaintenance(tenantPhone, summary, urgency, availability, ad
     `Tenant Phone: ${tenantPhone}\n` +
     `Availability: ${availability}\n` +
     `Issue: ${summary}\n\n` +
-    `Please contact the tenant directly to confirm.`;
+    `Reply: Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>`;
 
   const emailBody =
     `New Maintenance Job - Action Required\n\n` +
@@ -508,23 +613,30 @@ app.post("/sms", async (req, res) => {
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(HELP_REPLY));
   }
 
-  // 4. Opted-out
+  // 4. Check if this is a maintenance person replying with a status update
+  if (MAINTENANCE_PHONES.has(from)) {
+    res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
+    await handleMaintenanceReply(from, body);
+    return;
+  }
+
+  // 5. Opted-out
   if (await isOptedOut(from)) {
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
 
-  // 5. First-time texter — opt them in and send welcome
+  // 6. First-time texter — opt them in and send welcome
   if (await isFirstTimeTexter(from)) {
     await recordOptIn(from);
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(OPT_IN_CONFIRMATION));
   }
 
-  // 6. Already resolved — start fresh
+  // 7. Already resolved — start fresh
   if (await isResolved(from)) {
     await clearConversation(from);
   }
 
-  // 7. Process with Claude
+  // 8. Process with Claude
   res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   processWithClaude(from, body);
 });
