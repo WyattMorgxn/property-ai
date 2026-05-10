@@ -606,7 +606,17 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
   const statsPromises = managers.map(m => getManagerStats(m.id));
   const stats = await Promise.all(statsPromises);
 
-  const rows = managers.map((m, i) => `
+  const PLAN_PRICES = { starter: 149, growth: 299, pro: 599 };
+
+  const mrr = managers.reduce((sum, m) => sum + (PLAN_PRICES[m.plan] || 0), 0);
+  const arr = mrr * 12;
+
+  function monthsActive(createdAt) {
+    const months = Math.floor((new Date() - new Date(createdAt)) / (1000 * 60 * 60 * 24 * 30));
+    return Math.max(1, months);
+  }
+
+  const clientRows = managers.map((m, i) => `
     <tr>
       <td>${m.name}</td>
       <td>${m.email || "-"}</td>
@@ -618,6 +628,22 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
     </tr>
   `).join("");
 
+  const revenueRows = managers.map(m => {
+    const monthly = PLAN_PRICES[m.plan] || 0;
+    const months = monthsActive(m.created_at);
+    const total = monthly * months;
+    return `
+      <tr>
+        <td>${m.name}</td>
+        <td><span style="background:#3b82f6;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${m.plan}</span></td>
+        <td style="color:#22c55e;font-weight:bold">$${monthly}/mo</td>
+        <td>${new Date(m.created_at).toLocaleDateString("en-US", { month: "short", year: "numeric" })}</td>
+        <td>${months} month${months !== 1 ? "s" : ""}</td>
+        <td style="font-weight:bold">$${total.toLocaleString()}</td>
+      </tr>
+    `;
+  }).join("");
+
   res.send(`
     <html><head><title>Tenant Flow AI Admin</title><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;color:#1e293b;}
@@ -625,22 +651,51 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
     .header h1{font-size:22px;}.logout{font-size:13px;color:#94a3b8;text-decoration:none;padding:6px 12px;border:1px solid #475569;border-radius:6px;}
     .content{padding:32px;}.section{background:white;border-radius:12px;padding:24px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
     h2{font-size:18px;margin-bottom:20px;}
-    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;flex-wrap:wrap;}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
     label{font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px;}
     input,select{width:100%;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none;}
     button{padding:12px 24px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin-top:8px;}
     table{width:100%;border-collapse:collapse;}th{text-align:left;padding:12px 16px;font-size:12px;color:#64748b;text-transform:uppercase;border-bottom:1px solid #e2e8f0;}
-    td{padding:14px 16px;font-size:14px;border-bottom:1px solid #f1f5f9;}tr:last-child td{border-bottom:none;}
+    td{padding:14px 16px;font-size:14px;border-bottom:1px solid #f1f5f9;}tr:last-child td{border-bottom:none;}tr:hover td{background:#f8fafc;}
     .stat-row{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap;}
     .stat{background:white;border-radius:12px;padding:20px 24px;flex:1;min-width:120px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
     .stat .num{font-size:28px;font-weight:bold;}.stat .label{font-size:12px;color:#64748b;margin-top:4px;}
+    .mrr-banner{background:linear-gradient(135deg,#1e293b,#334155);color:white;border-radius:12px;padding:28px 32px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;}
+    .mrr-banner .big{font-size:48px;font-weight:bold;color:#22c55e;}
+    .mrr-banner .sub{font-size:14px;color:#94a3b8;margin-top:4px;}
+    .mrr-banner .arr{font-size:22px;font-weight:bold;color:#94a3b8;}
     </style></head><body>
     <div class="header"><h1>Tenant Flow AI — Admin</h1><a href="/admin/logout" class="logout">Sign Out</a></div>
     <div class="content">
+
+      <div class="mrr-banner">
+        <div>
+          <div style="font-size:13px;color:#94a3b8;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.05em">Monthly Recurring Revenue</div>
+          <div class="big">$${mrr.toLocaleString()}</div>
+          <div class="sub">${managers.length} active client${managers.length !== 1 ? "s" : ""}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:13px;color:#94a3b8;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.05em">Annual Run Rate</div>
+          <div class="arr">$${arr.toLocaleString()}/yr</div>
+        </div>
+      </div>
+
       <div class="stat-row">
         <div class="stat"><div class="num">${managers.length}</div><div class="label">Total Clients</div></div>
-        <div class="stat"><div class="num" style="color:#22c55e">${stats.reduce((a,s)=>a+parseInt(s.total),0)}</div><div class="label">Total Requests</div></div>
+        <div class="stat"><div class="num" style="color:#22c55e">$${mrr.toLocaleString()}</div><div class="label">MRR</div></div>
         <div class="stat"><div class="num" style="color:#f97316">${stats.reduce((a,s)=>a+parseInt(s.active),0)}</div><div class="label">Active Requests</div></div>
+        <div class="stat"><div class="num" style="color:#3b82f6">${stats.reduce((a,s)=>a+parseInt(s.total),0)}</div><div class="label">Total Requests</div></div>
+      </div>
+
+      <div class="section">
+        <h2>Revenue Tracker</h2>
+        <table>
+          <thead><tr><th>Client</th><th>Plan</th><th>Monthly Revenue</th><th>Started</th><th>Months Active</th><th>Total Paid</th></tr></thead>
+          <tbody>${revenueRows || '<tr><td colspan="6" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
+        </table>
+        <div style="padding:16px;text-align:right;font-size:15px;font-weight:bold;color:#1e293b;border-top:2px solid #e2e8f0;margin-top:8px">
+          Total MRR: <span style="color:#22c55e;font-size:20px">$${mrr.toLocaleString()}/mo</span>
+        </div>
       </div>
 
       <div class="section">
@@ -662,7 +717,7 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
         <h2>All Clients</h2>
         <table>
           <thead><tr><th>Name</th><th>Email</th><th>Twilio Number</th><th>Plan</th><th>Total Requests</th><th>Active</th><th>Added</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
+          <tbody>${clientRows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
         </table>
       </div>
     </div></body></html>
