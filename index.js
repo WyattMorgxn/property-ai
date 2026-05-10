@@ -5,6 +5,7 @@ import pg from "pg";
 const { Pool } = pg;
 const app = express();
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 // ─────────────────────────────────────────────
 // DATABASE
@@ -48,8 +49,7 @@ async function initDb() {
 async function saveRequest(tenantPhone, address, summary, urgency, availability, category) {
   const res = await pool.query(`
     INSERT INTO requests (tenant_phone, address, summary, urgency, availability, category, status)
-    VALUES ($1, $2, $3, $4, $5, $6, 'active')
-    RETURNING id
+    VALUES ($1, $2, $3, $4, $5, $6, 'active') RETURNING id
   `, [tenantPhone, address, summary, urgency, availability, category]);
   return res.rows[0].id;
 }
@@ -62,13 +62,15 @@ async function updateRequestStatus(address, status) {
 }
 
 async function getAllRequests() {
-  const res = await pool.query(`
-    SELECT * FROM requests ORDER BY created_at DESC
-  `);
+  const res = await pool.query("SELECT * FROM requests ORDER BY created_at DESC");
   return res.rows;
 }
 
-// Tenant profile functions
+async function markRequestDone(id) {
+  await pool.query("UPDATE requests SET status = 'completed', updated_at = NOW() WHERE id = $1", [id]);
+}
+
+// Tenant functions
 async function getTenant(phone) {
   const res = await pool.query("SELECT * FROM tenants WHERE phone = $1", [phone]);
   return res.rows[0] || null;
@@ -83,11 +85,6 @@ async function upsertTenant(phone, data) {
       opted_in = COALESCE($3, tenants.opted_in),
       opted_out = COALESCE($4, tenants.opted_out)
   `, [phone, data.address || null, data.opted_in ?? true, data.opted_out ?? false]);
-}
-
-async function hasAddress(phone) {
-  const tenant = await getTenant(phone);
-  return tenant && tenant.address;
 }
 
 async function saveAddress(phone, address) {
@@ -159,56 +156,43 @@ async function clearConversation(phone) {
 // ─────────────────────────────────────────────
 const MAINTENANCE_CONTACTS = {
   plumbing: {
-    name: "Plumbing Team",
-    phone: "+13308106687",
+    name: "Plumbing Team", phone: "+13308106687",
     keywords: ["leak", "leaking", "pipe", "drain", "toilet", "sink", "faucet", "water heater", "clog", "clogged", "flood", "flooding", "sewage", "water"],
   },
   electrical: {
-    name: "Electrical Team",
-    phone: "+13308106687",
+    name: "Electrical Team", phone: "+13308106687",
     keywords: ["electric", "electrical", "outlet", "breaker", "power", "light", "lights", "wiring", "spark", "shock", "circuit", "fuse"],
   },
   hvac: {
-    name: "HVAC Team",
-    phone: "+13308106687",
+    name: "HVAC Team", phone: "+13308106687",
     keywords: ["heat", "heating", "ac", "air conditioning", "hvac", "furnace", "thermostat", "vent", "ventilation", "cold", "hot", "temperature"],
   },
   structural: {
-    name: "Structural Team",
-    phone: "+13308106687",
+    name: "Structural Team", phone: "+13308106687",
     keywords: ["door", "window", "wall", "floor", "ceiling", "roof", "crack", "hole", "broken", "damage", "structural", "stairs", "railing"],
   },
   pest: {
-    name: "Pest Control Team",
-    phone: "+13308106687",
+    name: "Pest Control Team", phone: "+13308106687",
     keywords: ["bug", "bugs", "pest", "roach", "cockroach", "mouse", "mice", "rat", "rats", "ant", "ants", "spider", "insect", "rodent", "termite"],
   },
   security: {
-    name: "Security Team",
-    phone: "+13308106687",
+    name: "Security Team", phone: "+13308106687",
     keywords: ["lock", "locks", "key", "keys", "entry", "door lock", "deadbolt", "security", "locked out", "break in", "broken lock"],
   },
   appliances: {
-    name: "Appliance Team",
-    phone: "+13308106687",
+    name: "Appliance Team", phone: "+13308106687",
     keywords: ["stove", "oven", "fridge", "refrigerator", "washer", "dryer", "dishwasher", "microwave", "appliance", "garbage disposal"],
   },
-  general: {
-    name: "General Maintenance",
-    phone: "+13308106687",
-    keywords: [],
-  },
+  general: { name: "General Maintenance", phone: "+13308106687", keywords: [] },
 };
 
 const MAINTENANCE_PHONES = new Set(Object.values(MAINTENANCE_CONTACTS).map(c => c.phone));
 
 function getMaintenanceContact(summary) {
-  const lowerSummary = summary.toLowerCase();
+  const lower = summary.toLowerCase();
   for (const [category, contact] of Object.entries(MAINTENANCE_CONTACTS)) {
     if (category === "general") continue;
-    if (contact.keywords.some(keyword => lowerSummary.includes(keyword))) {
-      return { category, ...contact };
-    }
+    if (contact.keywords.some(k => lower.includes(k))) return { category, ...contact };
   }
   return { category: "general", ...MAINTENANCE_CONTACTS.general };
 }
@@ -242,43 +226,28 @@ function extractAddress(body) {
 
 async function handleMaintenanceReply(from, body) {
   const status = detectStatusKeyword(body);
-
   if (!status) {
-    await sendSms(from,
-      "Tenant Flow AI: To update a job, text: Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>."
-    );
+    await sendSms(from, "Tenant Flow AI: To update a job, text: Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>.");
     return;
   }
-
   const address = extractAddress(body);
   if (!address) {
     await sendSms(from, "Please include the property address. Example: Done 111 Woodlawn Lima Ohio");
     return;
   }
-
   const tenant = await getTenantByAddress(address);
   if (!tenant) {
     await sendSms(from, `Could not find a tenant at "${address}". Please check the address and try again.`);
     return;
   }
-
   console.log(`[MAINTENANCE REPLY] Status: ${status} | Address: ${address} | Tenant: ${tenant.phone}`);
-
-  // Update request status in database
   const dbStatus = status === "done" ? "completed" : status === "onmyway" ? "active" : status;
   await updateRequestStatus(address, dbStatus);
-
   let tenantMessage = "";
-  if (status === "done") {
-    tenantMessage = `Good news! Your maintenance issue at ${tenant.address} has been resolved. Reply if you have any further concerns. Reply STOP to opt out or HELP for assistance.`;
-  } else if (status === "scheduled") {
-    tenantMessage = `Your maintenance appointment at ${tenant.address} has been scheduled. Your technician will contact you directly to confirm the exact time. Reply STOP to opt out or HELP for assistance.`;
-  } else if (status === "onmyway") {
-    tenantMessage = `Your technician is on the way to ${tenant.address}! Please make sure someone is available to let them in. Reply STOP to opt out or HELP for assistance.`;
-  } else if (status === "unavailable") {
-    tenantMessage = `We are working on rescheduling your maintenance visit at ${tenant.address}. We will follow up shortly with a new time. Reply STOP to opt out or HELP for assistance.`;
-  }
-
+  if (status === "done") tenantMessage = `Good news! Your maintenance issue at ${tenant.address} has been resolved. Reply if you have any further concerns. Reply STOP to opt out or HELP for assistance.`;
+  else if (status === "scheduled") tenantMessage = `Your maintenance appointment at ${tenant.address} has been scheduled. Your technician will contact you to confirm the exact time. Reply STOP to opt out or HELP for assistance.`;
+  else if (status === "onmyway") tenantMessage = `Your technician is on the way to ${tenant.address}! Please make sure someone is available. Reply STOP to opt out or HELP for assistance.`;
+  else if (status === "unavailable") tenantMessage = `We are working on rescheduling your maintenance visit at ${tenant.address}. We will follow up shortly. Reply STOP to opt out or HELP for assistance.`;
   await sendSms(tenant.phone, tenantMessage);
   await sendSms(from, `Got it! Tenant at ${tenant.address} has been notified.`);
 }
@@ -328,23 +297,18 @@ const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
 
 const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
+  host: "smtp.gmail.com", port: 587, secure: false,
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
 });
 
-transporter.verify(function (error) {
-  if (error) console.error("[EMAIL VERIFY ERROR]", error.message);
+transporter.verify(err => {
+  if (err) console.error("[EMAIL VERIFY ERROR]", err.message);
   else console.log("[EMAIL READY] Gmail connection verified");
 });
 
 async function sendEmail(to, subject, body) {
   try {
-    const info = await transporter.sendMail({
-      from: `"Tenant Flow AI" <${GMAIL_USER}>`,
-      to, subject, text: body,
-    });
+    const info = await transporter.sendMail({ from: `"Tenant Flow AI" <${GMAIL_USER}>`, to, subject, text: body });
     console.log(`[EMAIL SENT] to ${to} | ID: ${info.messageId}`);
   } catch (err) {
     console.error("[EMAIL ERROR]", err.message);
@@ -352,36 +316,19 @@ async function sendEmail(to, subject, body) {
 }
 
 // ─────────────────────────────────────────────
-// NOTIFY MAINTENANCE PERSON
+// NOTIFY MAINTENANCE
 // ─────────────────────────────────────────────
 async function notifyMaintenance(tenantPhone, summary, urgency, availability, address) {
   const contact = getMaintenanceContact(summary);
-
   await saveRequest(tenantPhone, address, summary, urgency, availability, contact.category);
-
   const smsMessage =
-    `TENANT FLOW AI - NEW JOB\n` +
-    `Category: ${contact.category.toUpperCase()}\n` +
-    `Urgency: ${urgency}\n` +
-    `Property: ${address}\n` +
-    `Tenant Phone: ${tenantPhone}\n` +
-    `Availability: ${availability}\n` +
-    `Issue: ${summary}\n\n` +
+    `TENANT FLOW AI - NEW JOB\nCategory: ${contact.category.toUpperCase()}\nUrgency: ${urgency}\n` +
+    `Property: ${address}\nTenant Phone: ${tenantPhone}\nAvailability: ${availability}\nIssue: ${summary}\n\n` +
     `Reply: Done <address>, Scheduled <address>, On my way <address>, or Unavailable <address>`;
-
   const emailBody =
-    `New Maintenance Job - Action Required\n\n` +
-    `Category: ${contact.category.toUpperCase()}\n` +
-    `Property: ${address}\n` +
-    `Tenant Phone: ${tenantPhone}\n` +
-    `Urgency: ${urgency}\n` +
-    `Tenant Availability: ${availability}\n\n` +
-    `Issue:\n${summary}\n\n` +
-    `Please contact the tenant directly to confirm the appointment.\n\n` +
-    `---\nTenant Flow AI`;
-
-  console.log(`[MAINTENANCE ALERT] Routing to ${contact.name} (${contact.phone}) for ${contact.category}`);
-
+    `New Maintenance Job\n\nCategory: ${contact.category.toUpperCase()}\nProperty: ${address}\n` +
+    `Tenant Phone: ${tenantPhone}\nUrgency: ${urgency}\nAvailability: ${availability}\n\nIssue:\n${summary}\n\n---\nTenant Flow AI`;
+  console.log(`[MAINTENANCE ALERT] ${contact.name} (${contact.phone}) → ${contact.category}`);
   await Promise.all([
     sendSms(contact.phone, smsMessage),
     sendEmail(GMAIL_USER, `[${urgency}] ${contact.category.toUpperCase()} - ${address}`, emailBody),
@@ -424,12 +371,7 @@ Never make up technician names or exact times. Always end visible messages with 
 function parseResolution(text) {
   const match = text.match(/RESOLVED\|URGENCY:(\w+)\|SUMMARY:([^|]+)\|AVAILABILITY:([^|]+)\|ADDRESS:(.+)/);
   if (!match) return null;
-  return {
-    urgency: match[1].toUpperCase(),
-    summary: match[2].trim(),
-    availability: match[3].trim(),
-    address: match[4].trim(),
-  };
+  return { urgency: match[1].toUpperCase(), summary: match[2].trim(), availability: match[3].trim(), address: match[4].trim() };
 }
 
 function stripResolutionLine(text) {
@@ -441,46 +383,28 @@ async function processWithClaude(tenantPhone, message) {
     await addMessage(tenantPhone, "user", message);
     const convo = await getConversation(tenantPhone);
     console.log(`[CLAUDE] ${tenantPhone} (${convo.messages.length} msgs)`);
-
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 400,
-        system: SYSTEM_PROMPT,
-        messages: convo.messages,
-      }),
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 400, system: SYSTEM_PROMPT, messages: convo.messages }),
     });
-
     const data = await response.json();
-
     if (!response.ok) {
       console.error("[CLAUDE ERROR]", data);
       await sendSms(tenantPhone, "Tenant Flow AI: We received your message and will follow up shortly. Reply STOP to opt out or HELP for assistance.");
       return;
     }
-
-    const rawReply   = data.content[0].text;
+    const rawReply = data.content[0].text;
     const resolution = parseResolution(rawReply);
-    const reply      = stripResolutionLine(rawReply);
-
+    const reply = stripResolutionLine(rawReply);
     await addMessage(tenantPhone, "assistant", rawReply);
     await sendSms(tenantPhone, reply);
-
     if (resolution) {
-      if (resolution.address && resolution.address !== "Unknown") {
-        await saveAddress(tenantPhone, resolution.address);
-      }
+      if (resolution.address && resolution.address !== "Unknown") await saveAddress(tenantPhone, resolution.address);
       console.log(`[RESOLVED] ${tenantPhone} | ${resolution.urgency} | ${resolution.summary}`);
       await markResolved(tenantPhone);
       await notifyMaintenance(tenantPhone, resolution.summary, resolution.urgency, resolution.availability, resolution.address);
     }
-
   } catch (err) {
     console.error("[CLAUDE EXCEPTION]", err);
     await sendSms(tenantPhone, "Tenant Flow AI: We received your message and will follow up shortly. Reply STOP to opt out or HELP for assistance.");
@@ -493,24 +417,20 @@ async function processWithClaude(tenantPhone, message) {
 function twimlResponse(msg) {
   return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + msg + '</Message></Response>';
 }
-
 function emptyTwiml() {
   return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
-
-function urgencyColor(urgency) {
-  if (urgency === "EMERGENCY") return "#ef4444";
-  if (urgency === "URGENT") return "#f97316";
+function urgencyColor(u) {
+  if (u === "EMERGENCY") return "#ef4444";
+  if (u === "URGENT") return "#f97316";
   return "#22c55e";
 }
-
-function statusColor(status) {
-  if (status === "completed") return "#22c55e";
-  if (status === "scheduled") return "#3b82f6";
-  if (status === "unavailable") return "#ef4444";
+function statusColor(s) {
+  if (s === "completed") return "#22c55e";
+  if (s === "scheduled") return "#3b82f6";
+  if (s === "unavailable") return "#ef4444";
   return "#f97316";
 }
-
 function timeAgo(date) {
   const seconds = Math.floor((new Date() - new Date(date)) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
@@ -518,6 +438,30 @@ function timeAgo(date) {
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
   return `${Math.floor(seconds / 86400)}d ago`;
 }
+
+// ─────────────────────────────────────────────
+// DASHBOARD AUTH
+// ─────────────────────────────────────────────
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "Tenaro";
+
+function checkAuth(req, res, next) {
+  const session = req.cookies?.dashboard_auth;
+  if (session === DASHBOARD_PASSWORD) return next();
+  res.redirect("/login");
+}
+
+// Simple cookie parser
+app.use((req, res, next) => {
+  req.cookies = {};
+  const cookieHeader = req.headers.cookie;
+  if (cookieHeader) {
+    cookieHeader.split(";").forEach(cookie => {
+      const [key, val] = cookie.trim().split("=");
+      req.cookies[key] = val;
+    });
+  }
+  next();
+});
 
 // ─────────────────────────────────────────────
 // LOGGING MIDDLEWARE
@@ -528,9 +472,63 @@ app.use((req, res, next) => {
 });
 
 // ─────────────────────────────────────────────
+// LOGIN PAGE
+// ─────────────────────────────────────────────
+app.get("/login", (req, res) => {
+  const error = req.query.error ? '<p style="color:#ef4444;margin-bottom:16px;font-size:14px;">Incorrect password. Try again.</p>' : "";
+  res.status(200).send(`
+    <html>
+    <head>
+      <title>Tenant Flow AI — Login</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; background: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .card { background: white; border-radius: 16px; padding: 40px; width: 100%; max-width: 380px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+        h1 { font-size: 22px; color: #1e293b; margin-bottom: 8px; }
+        p { font-size: 14px; color: #64748b; margin-bottom: 28px; }
+        label { font-size: 13px; font-weight: bold; color: #374151; display: block; margin-bottom: 6px; }
+        input { width: 100%; padding: 12px 14px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 15px; outline: none; }
+        input:focus { border-color: #1e293b; }
+        button { width: 100%; padding: 13px; background: #1e293b; color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; margin-top: 16px; }
+        button:hover { background: #334155; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Tenant Flow AI</h1>
+        <p>Sign in to access the dashboard</p>
+        ${error}
+        <form method="POST" action="/login">
+          <label>Password</label>
+          <input type="password" name="password" placeholder="Enter password" autofocus>
+          <button type="submit">Sign In</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+app.post("/login", (req, res) => {
+  const { password } = req.body;
+  if (password === DASHBOARD_PASSWORD) {
+    res.setHeader("Set-Cookie", `dashboard_auth=${DASHBOARD_PASSWORD}; Path=/; HttpOnly; Max-Age=86400`);
+    res.redirect("/dashboard");
+  } else {
+    res.redirect("/login?error=1");
+  }
+});
+
+app.get("/logout", (req, res) => {
+  res.setHeader("Set-Cookie", "dashboard_auth=; Path=/; HttpOnly; Max-Age=0");
+  res.redirect("/login");
+});
+
+// ─────────────────────────────────────────────
 // DASHBOARD
 // ─────────────────────────────────────────────
-app.get("/dashboard", async (req, res) => {
+app.get("/dashboard", checkAuth, async (req, res) => {
   const filter = req.query.filter || "all";
   let requests = await getAllRequests();
 
@@ -538,10 +536,11 @@ app.get("/dashboard", async (req, res) => {
   if (filter === "completed") requests = requests.filter(r => r.status === "completed");
   if (filter === "scheduled") requests = requests.filter(r => r.status === "scheduled");
 
-  const total     = requests.length;
-  const active    = requests.filter(r => r.status === "active").length;
-  const completed = requests.filter(r => r.status === "completed").length;
-  const emergency = requests.filter(r => r.urgency === "EMERGENCY").length;
+  const allRequests = await getAllRequests();
+  const total     = allRequests.length;
+  const active    = allRequests.filter(r => r.status === "active").length;
+  const completed = allRequests.filter(r => r.status === "completed").length;
+  const emergency = allRequests.filter(r => r.urgency === "EMERGENCY").length;
 
   const rows = requests.map(r => `
     <tr>
@@ -553,6 +552,9 @@ app.get("/dashboard", async (req, res) => {
       <td>${r.summary}</td>
       <td>${r.availability}</td>
       <td><span style="background:${statusColor(r.status)};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${r.status}</span></td>
+      <td>
+        ${r.status !== "completed" ? `<form method="POST" action="/dashboard/complete/${r.id}" style="display:inline"><button type="submit" style="background:#22c55e;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Mark Done</button></form>` : ""}
+      </td>
     </tr>
   `).join("");
 
@@ -566,7 +568,10 @@ app.get("/dashboard", async (req, res) => {
         body { font-family: Arial, sans-serif; background: #f1f5f9; color: #1e293b; }
         .header { background: #1e293b; color: white; padding: 20px 32px; display: flex; align-items: center; justify-content: space-between; }
         .header h1 { font-size: 22px; }
-        .header span { font-size: 14px; color: #94a3b8; }
+        .header-right { display: flex; align-items: center; gap: 20px; }
+        .header-right span { font-size: 13px; color: #94a3b8; }
+        .logout { font-size: 13px; color: #94a3b8; text-decoration: none; padding: 6px 12px; border: 1px solid #475569; border-radius: 6px; }
+        .logout:hover { background: #334155; color: white; }
         .stats { display: flex; gap: 16px; padding: 24px 32px; flex-wrap: wrap; }
         .stat { background: white; border-radius: 12px; padding: 20px 24px; flex: 1; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
         .stat .num { font-size: 32px; font-weight: bold; }
@@ -575,7 +580,7 @@ app.get("/dashboard", async (req, res) => {
         .stat.active .num { color: #f97316; }
         .stat.completed .num { color: #22c55e; }
         .filters { padding: 0 32px 16px; display: flex; gap: 8px; flex-wrap: wrap; }
-        .filters a { padding: 8px 16px; border-radius: 20px; text-decoration: none; font-size: 13px; font-weight: bold; background: white; color: #64748b; border: 2px solid transparent; }
+        .filters a { padding: 8px 16px; border-radius: 20px; text-decoration: none; font-size: 13px; font-weight: bold; background: white; color: #64748b; }
         .filters a.active { background: #1e293b; color: white; }
         .table-wrap { padding: 0 32px 32px; overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
@@ -584,33 +589,23 @@ app.get("/dashboard", async (req, res) => {
         tr:last-child td { border-bottom: none; }
         tr:hover td { background: #f8fafc; }
         .empty { text-align: center; padding: 60px; color: #94a3b8; font-size: 16px; }
-        .refresh { font-size: 13px; color: #94a3b8; }
       </style>
       <meta http-equiv="refresh" content="30">
     </head>
     <body>
       <div class="header">
         <h1>Tenant Flow AI Dashboard</h1>
-        <span class="refresh">Auto-refreshes every 30 seconds</span>
+        <div class="header-right">
+          <span>Auto-refreshes every 30s</span>
+          <a href="/logout" class="logout">Sign Out</a>
+        </div>
       </div>
 
       <div class="stats">
-        <div class="stat">
-          <div class="num">${total}</div>
-          <div class="label">Total Requests</div>
-        </div>
-        <div class="stat active">
-          <div class="num">${active}</div>
-          <div class="label">Active</div>
-        </div>
-        <div class="stat completed">
-          <div class="num">${completed}</div>
-          <div class="label">Completed</div>
-        </div>
-        <div class="stat emergency">
-          <div class="num">${emergency}</div>
-          <div class="label">Emergencies</div>
-        </div>
+        <div class="stat"><div class="num">${total}</div><div class="label">Total Requests</div></div>
+        <div class="stat active"><div class="num">${active}</div><div class="label">Active</div></div>
+        <div class="stat completed"><div class="num">${completed}</div><div class="label">Completed</div></div>
+        <div class="stat emergency"><div class="num">${emergency}</div><div class="label">Emergencies</div></div>
       </div>
 
       <div class="filters">
@@ -624,24 +619,24 @@ app.get("/dashboard", async (req, res) => {
         <table>
           <thead>
             <tr>
-              <th>Time</th>
-              <th>Property</th>
-              <th>Tenant</th>
-              <th>Urgency</th>
-              <th>Category</th>
-              <th>Issue</th>
-              <th>Availability</th>
-              <th>Status</th>
+              <th>Time</th><th>Property</th><th>Tenant</th><th>Urgency</th>
+              <th>Category</th><th>Issue</th><th>Availability</th><th>Status</th><th>Action</th>
             </tr>
           </thead>
           <tbody>
-            ${rows || '<tr><td colspan="8" class="empty">No requests found</td></tr>'}
+            ${rows || '<tr><td colspan="9" class="empty">No requests found</td></tr>'}
           </tbody>
         </table>
       </div>
     </body>
     </html>
   `);
+});
+
+// Mark request as done from dashboard
+app.post("/dashboard/complete/:id", checkAuth, async (req, res) => {
+  await markRequestDone(req.params.id);
+  res.redirect("/dashboard");
 });
 
 // ─────────────────────────────────────────────
@@ -651,12 +646,9 @@ app.get("/", (req, res) => {
   res.status(200).send(
     '<html><head><title>Tenant Flow AI</title><style>' +
     'body{font-family:Arial,sans-serif;background:#f5f7fb;text-align:center;padding:60px;color:#333;}' +
-    'h1{font-size:42px;margin-bottom:10px;}' +
-    'p{font-size:18px;max-width:900px;margin:12px auto;line-height:1.6;}' +
-    '.section-title{font-weight:bold;margin-top:30px;font-size:20px;}' +
-    '.owner{margin-top:25px;font-weight:bold;}' +
-    '.contact{margin-top:20px;font-weight:bold;}' +
-    '.links{margin-top:25px;}' +
+    'h1{font-size:42px;margin-bottom:10px;}p{font-size:18px;max-width:900px;margin:12px auto;line-height:1.6;}' +
+    '.section-title{font-weight:bold;margin-top:30px;font-size:20px;}.owner{margin-top:25px;font-weight:bold;}' +
+    '.contact{margin-top:20px;font-weight:bold;}.links{margin-top:25px;}' +
     '.links a{margin:0 10px;color:#2563eb;text-decoration:none;font-weight:bold;}' +
     'footer{margin-top:60px;font-size:14px;color:#777;}' +
     '</style></head><body>' +
@@ -664,7 +656,7 @@ app.get("/", (req, res) => {
     '<p>AI-powered tenant maintenance communication platform for property managers.</p>' +
     '<p>Tenants can report maintenance issues via SMS. The system collects all details and automatically dispatches the right maintenance person.</p>' +
     '<p class="section-title">How It Works</p>' +
-    '<p>Tenants text their issue. Tenant Flow AI collects the issue details, unit address, and availability — then contacts the right maintenance person directly so they can reach out to the tenant to schedule the repair.</p>' +
+    '<p>Tenants text their issue. Tenant Flow AI collects the issue details, unit address, and availability — then contacts the right maintenance person directly.</p>' +
     '<p class="section-title">How to Get Started</p>' +
     '<p>Text the Tenant Flow AI phone number to report a maintenance issue. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
     '<p class="section-title">SMS Consent and Compliance</p>' +
@@ -673,17 +665,14 @@ app.get("/", (req, res) => {
     '<p>Business Location: United States</p><p>Service Type: Property Management Communication Software</p>' +
     '<p class="contact">Contact: wyattmorgan@tenant-flow-ai.com</p>' +
     '<div class="links"><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms and Conditions</a> | <a href="/dashboard">Dashboard</a></div>' +
-    '<footer>&copy; 2026 Tenant Flow AI</footer>' +
-    '</body></html>'
+    '<footer>&copy; 2026 Tenant Flow AI</footer></body></html>'
   );
 });
 
 // ─────────────────────────────────────────────
 // SMS ENDPOINT
 // ─────────────────────────────────────────────
-app.get("/sms", (req, res) => {
-  res.status(200).send("SMS endpoint alive. Twilio must POST here.");
-});
+app.get("/sms", (req, res) => res.status(200).send("SMS endpoint alive. Twilio must POST here."));
 
 app.post("/sms", async (req, res) => {
   const from    = req.body.From || "";
@@ -697,35 +686,24 @@ app.post("/sms", async (req, res) => {
     await clearConversation(from);
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
-
   if (START_KEYWORDS.has(keyword)) {
     await recordOptIn(from);
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(OPT_IN_CONFIRMATION));
   }
-
   if (keyword === "HELP") {
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(HELP_REPLY));
   }
-
-  // Check if this is a maintenance person replying
   if (MAINTENANCE_PHONES.has(from)) {
     res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
     await handleMaintenanceReply(from, body);
     return;
   }
-
-  if (await isOptedOut(from)) {
-    return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
-  }
-
+  if (await isOptedOut(from)) return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   if (await isFirstTimeTexter(from)) {
     await recordOptIn(from);
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(OPT_IN_CONFIRMATION));
   }
-
-  if (await isResolved(from)) {
-    await clearConversation(from);
-  }
+  if (await isResolved(from)) await clearConversation(from);
 
   res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   processWithClaude(from, body);
@@ -737,19 +715,13 @@ app.post("/sms", async (req, res) => {
 app.get("/privacy", (req, res) => {
   res.status(200).send(
     '<html><head><title>Privacy Policy</title><style>body{font-family:Arial,sans-serif;background:#f5f7fb;padding:40px;color:#333;max-width:900px;margin:auto;line-height:1.7;}h1{font-size:36px;margin-bottom:20px;}h2{font-size:24px;margin-top:30px;}p{font-size:18px;margin-bottom:15px;}</style></head><body>' +
-    '<h1>Privacy Policy</h1>' +
-    '<p>Tenant Flow AI collects phone numbers, addresses, and message content to facilitate communication between tenants and maintenance personnel.</p>' +
-    '<h2>Information We Collect</h2>' +
-    '<p>We collect phone numbers, unit addresses, message content, maintenance issue details, and communication history.</p>' +
-    '<h2>How We Use Information</h2>' +
-    '<p>We use this information solely for service-related communication including maintenance requests, scheduling updates, and property management communication.</p>' +
-    '<h2>Information Sharing</h2>' +
-    '<p>Tenant Flow AI does not sell or share personal information with third parties for marketing purposes. Mobile numbers are never sold or shared.</p>' +
-    '<h2>SMS Messaging and Opt-In</h2>' +
-    '<p>Users opt in by sending the first text message to Tenant Flow AI. Upon first contact, users automatically receive a confirmation message. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
+    '<h1>Privacy Policy</h1><p>Tenant Flow AI collects phone numbers, addresses, and message content to facilitate communication between tenants and maintenance personnel.</p>' +
+    '<h2>Information We Collect</h2><p>We collect phone numbers, unit addresses, message content, maintenance issue details, and communication history.</p>' +
+    '<h2>How We Use Information</h2><p>We use this information solely for service-related communication including maintenance requests, scheduling updates, and property management communication.</p>' +
+    '<h2>Information Sharing</h2><p>Tenant Flow AI does not sell or share personal information with third parties for marketing purposes. Mobile numbers are never sold or shared.</p>' +
+    '<h2>SMS Messaging and Opt-In</h2><p>Users opt in by sending the first text message to Tenant Flow AI. Upon first contact, users automatically receive a confirmation message. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
     '<h2>Opt-Out</h2><p>Users may opt out at any time by replying STOP.</p>' +
-    '<h2>Contact</h2><p>wyattmorgan@tenant-flow-ai.com</p>' +
-    '</body></html>'
+    '<h2>Contact</h2><p>wyattmorgan@tenant-flow-ai.com</p></body></html>'
   );
 });
 
@@ -759,36 +731,28 @@ app.get("/privacy", (req, res) => {
 app.get("/terms", (req, res) => {
   res.status(200).send(
     '<html><head><title>Terms and Conditions</title><style>body{font-family:Arial,sans-serif;background:#f5f7fb;padding:40px;color:#333;max-width:900px;margin:auto;line-height:1.7;}h1{font-size:36px;margin-bottom:20px;}h2{font-size:24px;margin-top:30px;}p{font-size:18px;margin-bottom:15px;}</style></head><body>' +
-    '<h1>Terms and Conditions</h1>' +
-    '<p>These Terms govern the use of Tenant Flow AI messaging services.</p>' +
-    '<h2>Program Description</h2>' +
-    '<p>Tenant Flow AI provides SMS-based communication for maintenance requests, scheduling, and property management communication.</p>' +
-    '<h2>Consent to Receive Messages</h2>' +
-    '<p>Users consent by sending the first text message. Upon first contact, users receive an opt-in confirmation recorded with a timestamp.</p>' +
+    '<h1>Terms and Conditions</h1><p>These Terms govern the use of Tenant Flow AI messaging services.</p>' +
+    '<h2>Program Description</h2><p>Tenant Flow AI provides SMS-based communication for maintenance requests, scheduling, and property management communication.</p>' +
+    '<h2>Consent to Receive Messages</h2><p>Users consent by sending the first text message. Upon first contact, users receive an opt-in confirmation recorded with a timestamp.</p>' +
     '<h2>Message Frequency</h2><p>Message frequency varies depending on maintenance activity.</p>' +
     '<h2>Fees</h2><p>Message and data rates may apply.</p>' +
     '<h2>Opt-Out</h2><p>Reply STOP at any time.</p>' +
     '<h2>Help</h2><p>Reply HELP for assistance.</p>' +
-    '<h2>Support</h2><p>wyattmorgan@tenant-flow-ai.com</p>' +
-    '</body></html>'
+    '<h2>Support</h2><p>wyattmorgan@tenant-flow-ai.com</p></body></html>'
   );
 });
 
 // ─────────────────────────────────────────────
 // 404 FALLBACK
 // ─────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).send("Not Found: " + req.method + " " + req.path);
-});
+app.use((req, res) => res.status(404).send("Not Found: " + req.method + " " + req.path));
 
 // ─────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────
 const port = process.env.PORT || 3000;
 initDb().then(() => {
-  app.listen(port, () => {
-    console.log("Server running on port " + port);
-  });
+  app.listen(port, () => console.log("Server running on port " + port));
 }).catch(err => {
   console.error("[DB INIT ERROR]", err);
   process.exit(1);
