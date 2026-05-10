@@ -818,8 +818,17 @@ app.get("/dashboard", checkManagerAuth, async (req, res) => {
       <td>${r.category}</td>
       <td>${r.summary}</td>
       <td>${r.availability}</td>
-      <td><span style="background:${statusColor(r.status)};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${r.status}</span></td>
-      <td>${r.status !== "completed" ? `<form method="POST" action="/dashboard/complete/${r.id}" style="display:inline"><button type="submit" style="background:#22c55e;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Mark Done</button></form>` : ""}</td>
+      <td>
+        <form method="POST" action="/dashboard/status/${r.id}" style="display:flex;align-items:center;gap:6px">
+          <select name="status" style="padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px">
+            <option value="active" ${r.status === "active" ? "selected" : ""}>Active</option>
+            <option value="scheduled" ${r.status === "scheduled" ? "selected" : ""}>Scheduled</option>
+            <option value="completed" ${r.status === "completed" ? "selected" : ""}>Completed</option>
+            <option value="unavailable" ${r.status === "unavailable" ? "selected" : ""}>Unavailable</option>
+          </select>
+          <button type="submit" style="background:#1e293b;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Save</button>
+        </form>
+      </td>
     </tr>
   `).join("");
 
@@ -859,10 +868,16 @@ app.get("/dashboard", checkManagerAuth, async (req, res) => {
       <a href="/dashboard?filter=scheduled" class="${filter==="scheduled"?"active":""}">Scheduled</a>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Time</th><th>Property</th><th>Tenant</th><th>Urgency</th><th>Category</th><th>Issue</th><th>Availability</th><th>Status</th><th>Action</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="9" class="empty">No requests found</td></tr>'}</tbody>
+      <thead><tr><th>Time</th><th>Property</th><th>Tenant</th><th>Urgency</th><th>Category</th><th>Issue</th><th>Availability</th><th>Status</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="empty">No requests found</td></tr>'}</tbody>
     </table></div></body></html>
   `);
+});
+
+app.post("/dashboard/status/:id", checkManagerAuth, async (req, res) => {
+  const { status } = req.body;
+  await pool.query("UPDATE requests SET status = $1, updated_at = NOW() WHERE id = $2", [status, req.params.id]);
+  res.redirect("/dashboard" + (req.headers.referer?.includes("filter=") ? "?" + req.headers.referer.split("?")[1] : ""));
 });
 
 app.post("/dashboard/complete/:id", checkManagerAuth, async (req, res) => {
