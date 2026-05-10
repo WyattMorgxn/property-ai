@@ -621,6 +621,7 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
       <td>${m.name}</td>
       <td>${m.email || "-"}</td>
       <td>${m.twilio_number}</td>
+      <td><code style="background:#f1f5f9;padding:2px 8px;border-radius:4px;font-size:13px">${m.dashboard_password}</code></td>
       <td><span style="background:#3b82f6;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${m.plan}</span></td>
       <td>${stats[i].total}</td>
       <td>${stats[i].active}</td>
@@ -716,8 +717,8 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
       <div class="section">
         <h2>All Clients</h2>
         <table>
-          <thead><tr><th>Name</th><th>Email</th><th>Twilio Number</th><th>Plan</th><th>Total Requests</th><th>Active</th><th>Added</th></tr></thead>
-          <tbody>${clientRows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
+          <thead><tr><th>Name</th><th>Email</th><th>Twilio Number</th><th>Dashboard Password</th><th>Plan</th><th>Total Requests</th><th>Active</th><th>Added</th></tr></thead>
+          <tbody>${clientRows || '<tr><td colspan="8" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
         </table>
       </div>
     </div></body></html>
