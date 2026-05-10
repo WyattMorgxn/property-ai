@@ -136,20 +136,61 @@ async function clearConversation(phone) {
 }
 
 // ─────────────────────────────────────────────
-// DEFAULT MANAGER
+// MAINTENANCE CONTACTS
+// Update phone numbers here when you get real contacts
 // ─────────────────────────────────────────────
-const DEFAULT_MANAGER = {
-  managerName: "Wyatt Morgan",
-  managerPhone: "+14192964656",
-  managerEmail: "Morgaw23@gmail.com",
+const MAINTENANCE_CONTACTS = {
+  plumbing: {
+    name: "Plumbing Team",
+    phone: "+13308106687",
+    keywords: ["leak", "leaking", "pipe", "drain", "toilet", "sink", "faucet", "water heater", "clog", "clogged", "flood", "flooding", "sewage", "water"],
+  },
+  electrical: {
+    name: "Electrical Team",
+    phone: "+13308106687",
+    keywords: ["electric", "electrical", "outlet", "breaker", "power", "light", "lights", "wiring", "spark", "shock", "circuit", "fuse"],
+  },
+  hvac: {
+    name: "HVAC Team",
+    phone: "+13308106687",
+    keywords: ["heat", "heating", "ac", "air conditioning", "hvac", "furnace", "thermostat", "vent", "ventilation", "cold", "hot", "temperature"],
+  },
+  structural: {
+    name: "Structural Team",
+    phone: "+13308106687",
+    keywords: ["door", "window", "wall", "floor", "ceiling", "roof", "crack", "hole", "broken", "damage", "structural", "stairs", "railing"],
+  },
+  pest: {
+    name: "Pest Control Team",
+    phone: "+13308106687",
+    keywords: ["bug", "bugs", "pest", "roach", "cockroach", "mouse", "mice", "rat", "rats", "ant", "ants", "spider", "insect", "rodent", "termite"],
+  },
+  security: {
+    name: "Security Team",
+    phone: "+13308106687",
+    keywords: ["lock", "locks", "key", "keys", "entry", "door lock", "deadbolt", "security", "locked out", "break in", "broken lock"],
+  },
+  appliances: {
+    name: "Appliance Team",
+    phone: "+13308106687",
+    keywords: ["stove", "oven", "fridge", "refrigerator", "washer", "dryer", "dishwasher", "microwave", "appliance", "garbage disposal"],
+  },
+  general: {
+    name: "General Maintenance",
+    phone: "+13308106687",
+    keywords: [],
+  },
 };
 
-async function getProfile(phone) {
-  const tenant = await getTenant(phone);
-  return {
-    ...DEFAULT_MANAGER,
-    address: tenant?.address || "Unknown Property",
-  };
+function getMaintenanceContact(summary) {
+  const lowerSummary = summary.toLowerCase();
+  for (const [category, contact] of Object.entries(MAINTENANCE_CONTACTS)) {
+    if (category === "general") continue;
+    if (contact.keywords.some(keyword => lowerSummary.includes(keyword))) {
+      return { category, ...contact };
+    }
+  }
+  return { category: "general", ...MAINTENANCE_CONTACTS.general };
 }
 
 // ─────────────────────────────────────────────
@@ -234,32 +275,39 @@ async function sendEmail(to, subject, body) {
 }
 
 // ─────────────────────────────────────────────
-// NOTIFY MANAGER
+// NOTIFY MAINTENANCE PERSON
+// Routes to the right team based on issue type
+// Also sends email summary
 // ─────────────────────────────────────────────
-async function notifyManager(tenantPhone, summary, urgency, availability) {
-  const profile = await getProfile(tenantPhone);
+async function notifyMaintenance(tenantPhone, summary, urgency, availability, address) {
+  const contact = getMaintenanceContact(summary);
 
   const smsMessage =
-    `TENANT FLOW AI - NEW REQUEST\n` +
-    `Property: ${profile.address}\n` +
-    `Tenant: ${tenantPhone}\n` +
+    `TENANT FLOW AI - NEW JOB\n` +
+    `Category: ${contact.category.toUpperCase()}\n` +
     `Urgency: ${urgency}\n` +
+    `Property: ${address}\n` +
+    `Tenant Phone: ${tenantPhone}\n` +
     `Availability: ${availability}\n` +
-    `Issue: ${summary}`;
+    `Issue: ${summary}\n\n` +
+    `Please contact the tenant directly to confirm.`;
 
   const emailBody =
-    `New Maintenance Request - Ready to Schedule\n\n` +
-    `Property: ${profile.address}\n` +
+    `New Maintenance Job - Action Required\n\n` +
+    `Category: ${contact.category.toUpperCase()}\n` +
+    `Property: ${address}\n` +
     `Tenant Phone: ${tenantPhone}\n` +
     `Urgency: ${urgency}\n` +
     `Tenant Availability: ${availability}\n\n` +
-    `Issue Summary:\n${summary}\n\n` +
-    `Next Step: Contact the tenant to confirm the appointment.\n\n` +
+    `Issue:\n${summary}\n\n` +
+    `Please contact the tenant directly to confirm the appointment.\n\n` +
     `---\nTenant Flow AI`;
 
+  console.log(`[MAINTENANCE ALERT] Routing to ${contact.name} (${contact.phone}) for ${contact.category}`);
+
   await Promise.all([
-    sendSms(profile.managerPhone, smsMessage),
-    sendEmail(profile.managerEmail, `[${urgency}] New Request - ${profile.address}`, emailBody),
+    sendSms(contact.phone, smsMessage),
+    sendEmail(GMAIL_USER, `[${urgency}] ${contact.category.toUpperCase()} - ${address}`, emailBody),
   ]);
 }
 
@@ -268,24 +316,26 @@ async function notifyManager(tenantPhone, summary, urgency, availability) {
 // ─────────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-const SYSTEM_PROMPT = `You are Tenant Flow AI, a friendly property management assistant that helps tenants submit maintenance requests via SMS.
+const SYSTEM_PROMPT = `You are Tenant Flow AI, a friendly AI property management assistant that helps tenants submit maintenance requests via SMS.
 
-Your goal is to collect all the information needed to schedule a repair in as few messages as possible. Keep messages short since this is SMS.
+Your goal is to collect all the information needed to dispatch the right maintenance person in as few messages as possible. Keep messages short since this is SMS.
 
 CONVERSATION FLOW:
 1. When a tenant first describes an issue, acknowledge it warmly.
-2. If they have not provided their unit address yet, ask for it naturally as part of the conversation (e.g. "Got it! What is your unit address so we can send someone out?")
+2. If they have not provided their unit address yet, ask for it naturally (e.g. "Got it! What is your unit address so we can send someone out?")
 3. Once you have the address, ask about their availability.
-4. Once you have the issue, address, and availability — confirm and tell them they are all set.
+4. Once you have the issue, address, and availability — confirm and tell them the right person will reach out shortly.
 5. One question per message maximum.
 
 URGENCY LEVELS:
-- EMERGENCY: gas leak, flooding, no heat in winter, electrical hazard → alert immediately, collect address if missing but skip availability
-- URGENT: no hot water, broken lock, major appliance failure → follow up within a few hours
+- EMERGENCY: gas leak, flooding, no heat in winter, electrical hazard → dispatch immediately, skip availability question
+- URGENT: no hot water, broken lock, major appliance failure → someone will follow up within a few hours
 - ROUTINE: minor repairs, cosmetic issues → scheduled within 1-2 business days
 
 WHEN YOU HAVE ENOUGH INFO:
-Send a warm confirmation then on the very last line write exactly:
+Send a warm confirmation like "You are all set! We are sending a technician your way. They will reach out to you directly at this number to confirm the appointment. Reply STOP to opt out or HELP for assistance."
+
+Then on the very last line write exactly:
 RESOLVED|URGENCY:<level>|SUMMARY:<one sentence summary>|AVAILABILITY:<their availability>|ADDRESS:<their address>
 
 Example: RESOLVED|URGENCY:ROUTINE|SUMMARY:Leaking kitchen sink|AVAILABILITY:Tomorrow morning|ADDRESS:324 Warner St Apt 2 Cincinnati OH
@@ -350,13 +400,18 @@ async function processWithClaude(tenantPhone, message) {
     await sendSms(tenantPhone, reply);
 
     if (resolution) {
-      // Save address to database if we got one
       if (resolution.address && resolution.address !== "Unknown") {
         await saveAddress(tenantPhone, resolution.address);
       }
       console.log(`[RESOLVED] ${tenantPhone} | ${resolution.urgency} | ${resolution.summary}`);
       await markResolved(tenantPhone);
-      await notifyManager(tenantPhone, resolution.summary, resolution.urgency, resolution.availability);
+      await notifyMaintenance(
+        tenantPhone,
+        resolution.summary,
+        resolution.urgency,
+        resolution.availability,
+        resolution.address
+      );
     }
 
   } catch (err) {
@@ -405,9 +460,9 @@ app.get("/", (req, res) => {
     '</style></head><body>' +
     '<h1>Tenant Flow AI</h1>' +
     '<p>AI-powered tenant maintenance communication platform for property managers.</p>' +
-    '<p>Tenants can report maintenance issues via SMS. The system collects all details, schedules repairs, and notifies property management automatically.</p>' +
+    '<p>Tenants can report maintenance issues via SMS. The system collects all details and automatically dispatches the right maintenance person.</p>' +
     '<p class="section-title">How It Works</p>' +
-    '<p>Tenants text their issue. Tenant Flow AI collects the issue details, unit address, and availability — then alerts the property manager with everything needed to schedule the repair.</p>' +
+    '<p>Tenants text their issue. Tenant Flow AI collects the issue details, unit address, and availability — then contacts the right maintenance person directly so they can reach out to the tenant to schedule the repair.</p>' +
     '<p class="section-title">How to Get Started</p>' +
     '<p>Text the Tenant Flow AI phone number to report a maintenance issue. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
     '<p class="section-title">SMS Consent and Compliance</p>' +
@@ -469,7 +524,7 @@ app.post("/sms", async (req, res) => {
     await clearConversation(from);
   }
 
-  // 7. Process with Claude (handles address collection naturally in conversation)
+  // 7. Process with Claude
   res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   processWithClaude(from, body);
 });
@@ -481,7 +536,7 @@ app.get("/privacy", (req, res) => {
   res.status(200).send(
     '<html><head><title>Privacy Policy</title><style>body{font-family:Arial,sans-serif;background:#f5f7fb;padding:40px;color:#333;max-width:900px;margin:auto;line-height:1.7;}h1{font-size:36px;margin-bottom:20px;}h2{font-size:24px;margin-top:30px;}p{font-size:18px;margin-bottom:15px;}</style></head><body>' +
     '<h1>Privacy Policy</h1>' +
-    '<p>Tenant Flow AI collects phone numbers, addresses, and message content to facilitate communication between tenants, property managers, and maintenance personnel.</p>' +
+    '<p>Tenant Flow AI collects phone numbers, addresses, and message content to facilitate communication between tenants and maintenance personnel.</p>' +
     '<h2>Information We Collect</h2>' +
     '<p>We collect phone numbers, unit addresses, message content, maintenance issue details, and communication history.</p>' +
     '<h2>How We Use Information</h2>' +
