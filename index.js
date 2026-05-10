@@ -198,6 +198,9 @@ async function sendSms(to, message) {
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
 
+console.log("[EMAIL CONFIG] User:", GMAIL_USER);
+console.log("[EMAIL CONFIG] Pass length:", GMAIL_PASS ? GMAIL_PASS.length : "NOT SET");
+
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 587,
@@ -208,15 +211,25 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+transporter.verify(function (error, success) {
+  if (error) {
+    console.error("[EMAIL VERIFY ERROR]", error.message);
+  } else {
+    console.log("[EMAIL READY] Gmail connection verified");
+  }
+});
+
 async function sendEmail(to, subject, body) {
   try {
-    await transporter.sendMail({
+    console.log(`[EMAIL ATTEMPTING] to ${to}`);
+    const info = await transporter.sendMail({
       from: `"Tenant Flow AI" <${GMAIL_USER}>`,
       to, subject, text: body,
     });
-    console.log(`[EMAIL SENT] to ${to}`);
+    console.log(`[EMAIL SENT] to ${to} | ID: ${info.messageId}`);
   } catch (err) {
     console.error("[EMAIL ERROR]", err.message);
+    console.error("[EMAIL ERROR CODE]", err.code);
   }
 }
 
