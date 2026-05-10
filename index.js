@@ -622,10 +622,24 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
       <td>${m.email || "-"}</td>
       <td>${m.twilio_number}</td>
       <td><code style="background:#f1f5f9;padding:2px 8px;border-radius:4px;font-size:13px">${m.dashboard_password}</code></td>
-      <td><span style="background:#3b82f6;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${m.plan}</span></td>
+      <td>
+        <form method="POST" action="/admin/managers/${m.id}/plan" style="display:flex;align-items:center;gap:6px">
+          <select name="plan" style="padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px">
+            <option value="starter" ${m.plan === "starter" ? "selected" : ""}>Starter $149</option>
+            <option value="growth" ${m.plan === "growth" ? "selected" : ""}>Growth $299</option>
+            <option value="pro" ${m.plan === "pro" ? "selected" : ""}>Pro $599</option>
+          </select>
+          <button type="submit" style="background:#3b82f6;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Save</button>
+        </form>
+      </td>
       <td>${stats[i].total}</td>
       <td>${stats[i].active}</td>
       <td>${timeAgo(m.created_at)}</td>
+      <td>
+        <form method="POST" action="/admin/managers/${m.id}/delete" onsubmit="return confirm('Delete ${m.name}? This cannot be undone.')">
+          <button type="submit" style="background:#ef4444;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Delete</button>
+        </form>
+      </td>
     </tr>
   `).join("");
 
@@ -717,8 +731,8 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
       <div class="section">
         <h2>All Clients</h2>
         <table>
-          <thead><tr><th>Name</th><th>Email</th><th>Twilio Number</th><th>Dashboard Password</th><th>Plan</th><th>Total Requests</th><th>Active</th><th>Added</th></tr></thead>
-          <tbody>${clientRows || '<tr><td colspan="8" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
+          <thead><tr><th>Name</th><th>Email</th><th>Twilio Number</th><th>Dashboard Password</th><th>Plan</th><th>Total Requests</th><th>Active</th><th>Added</th><th>Actions</th></tr></thead>
+          <tbody>${clientRows || '<tr><td colspan="9" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
         </table>
       </div>
     </div></body></html>
@@ -729,6 +743,25 @@ app.post("/admin/managers", checkAdminAuth, async (req, res) => {
   const { name, email, twilio_number, password, maintenance_phone, plan } = req.body;
   await createManager(name, email, twilio_number, password, plan, maintenance_phone);
   console.log(`[ADMIN] New manager created: ${name} | ${twilio_number}`);
+  res.redirect("/admin");
+});
+
+app.post("/admin/managers/:id/plan", checkAdminAuth, async (req, res) => {
+  const { plan } = req.body;
+  await pool.query("UPDATE managers SET plan = $1 WHERE id = $2", [plan, req.params.id]);
+  console.log(`[ADMIN] Plan updated for manager ${req.params.id} → ${plan}`);
+  res.redirect("/admin");
+});
+
+app.post("/admin/managers/:id/delete", checkAdminAuth, async (req, res) => {
+  const id = req.params.id;
+  // Delete in correct order to avoid foreign key violations
+  await pool.query("DELETE FROM maintenance_contacts WHERE manager_id = $1", [id]);
+  await pool.query("DELETE FROM requests WHERE manager_id = $1", [id]);
+  await pool.query("DELETE FROM conversations WHERE manager_id = $1", [id]);
+  await pool.query("DELETE FROM tenants WHERE manager_id = $1", [id]);
+  await pool.query("DELETE FROM managers WHERE id = $1", [id]);
+  console.log(`[ADMIN] Manager ${id} deleted`);
   res.redirect("/admin");
 });
 
