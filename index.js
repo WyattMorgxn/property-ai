@@ -53,9 +53,10 @@ async function initDb() {
   `);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id)`).catch(() => {});
 
-  // Fix conversations table — drop old primary key and use composite key
+  // Fix conversations table — drop and recreate with composite primary key
+  await pool.query(`DROP TABLE IF EXISTS conversations CASCADE`);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS conversations (
+    CREATE TABLE conversations (
       phone TEXT NOT NULL,
       manager_id INTEGER REFERENCES managers(id),
       messages JSONB DEFAULT '[]',
@@ -63,24 +64,7 @@ async function initDb() {
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (phone, manager_id)
     );
-  `).catch(async () => {
-    // Table exists — migrate to composite key if needed
-    await pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'conversations_pkey'
-          AND contype = 'p'
-          AND array_length(conkey, 1) = 2
-        ) THEN
-          ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_pkey;
-          ALTER TABLE conversations ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id);
-          ALTER TABLE conversations ADD PRIMARY KEY (phone, manager_id);
-        END IF;
-      END $$;
-    `).catch(() => {});
-  });
+  `);
 
   // Create or update requests table
   await pool.query(`
