@@ -131,7 +131,7 @@ async function getAllManagers() {
   return res.rows;
 }
 
-async function createManager(name, email, twilioNumber, password, plan, maintenancePhone) {
+async function createManager(name, email, twilioNumber, password, plan, contacts) {
   const res = await pool.query(`
     INSERT INTO managers (name, email, twilio_number, dashboard_password, plan)
     VALUES ($1, $2, $3, $4, $5) RETURNING id
@@ -140,9 +140,10 @@ async function createManager(name, email, twilioNumber, password, plan, maintena
 
   const categories = ["plumbing", "electrical", "hvac", "structural", "pest", "security", "appliances", "general"];
   for (const cat of categories) {
+    const phone = contacts[cat] || contacts.default || "+13308106687";
     await pool.query(
       "INSERT INTO maintenance_contacts (manager_id, category, name, phone) VALUES ($1, $2, $3, $4)",
-      [managerId, cat, cat.charAt(0).toUpperCase() + cat.slice(1) + " Team", maintenancePhone]
+      [managerId, cat, cat.charAt(0).toUpperCase() + cat.slice(1) + " Team", phone]
     );
   }
   return managerId;
@@ -635,7 +636,8 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
       <td>${stats[i].total}</td>
       <td>${stats[i].active}</td>
       <td>${timeAgo(m.created_at)}</td>
-      <td>
+      <td style="display:flex;gap:6px">
+        <a href="/admin/managers/${m.id}/contacts" style="background:#8b5cf6;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold;text-decoration:none">Edit Contacts</a>
         <form method="POST" action="/admin/managers/${m.id}/delete" onsubmit="return confirm('Delete ${m.name}? This cannot be undone.')">
           <button type="submit" style="background:#ef4444;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Delete</button>
         </form>
@@ -721,10 +723,23 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
             <div><label>Email</label><input name="email" type="email" placeholder="john@company.com"></div>
             <div><label>Twilio Phone Number</label><input name="twilio_number" placeholder="+15551234567" required></div>
             <div><label>Dashboard Password</label><input name="password" placeholder="their login password" required></div>
-            <div><label>Maintenance Contact Phone</label><input name="maintenance_phone" placeholder="+15559876543" required></div>
             <div><label>Plan</label><select name="plan"><option value="starter">Starter — $149/mo</option><option value="growth">Growth — $299/mo</option><option value="pro">Pro — $599/mo</option></select></div>
           </div>
-          <button type="submit">Add Client</button>
+          <div style="margin-top:20px">
+            <p style="font-size:13px;font-weight:bold;color:#374151;margin-bottom:12px">Maintenance Contacts (leave blank to use default for all)</p>
+            <div class="form-grid">
+              <div><label>🔧 Plumbing</label><input name="plumbing" placeholder="+15551234567"></div>
+              <div><label>⚡ Electrical</label><input name="electrical" placeholder="+15551234567"></div>
+              <div><label>❄️ HVAC</label><input name="hvac" placeholder="+15551234567"></div>
+              <div><label>🪟 Structural</label><input name="structural" placeholder="+15551234567"></div>
+              <div><label>🐛 Pest Control</label><input name="pest" placeholder="+15551234567"></div>
+              <div><label>🔒 Security</label><input name="security" placeholder="+15551234567"></div>
+              <div><label>🏠 Appliances</label><input name="appliances" placeholder="+15551234567"></div>
+              <div><label>🧹 General</label><input name="general" placeholder="+15551234567"></div>
+            </div>
+            <p style="font-size:12px;color:#94a3b8;margin-top:8px">Tip: You can set one number for all categories or different numbers per trade.</p>
+          </div>
+          <button type="submit" style="margin-top:16px">Add Client</button>
         </form>
       </div>
 
@@ -740,8 +755,9 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
 });
 
 app.post("/admin/managers", checkAdminAuth, async (req, res) => {
-  const { name, email, twilio_number, password, maintenance_phone, plan } = req.body;
-  await createManager(name, email, twilio_number, password, plan, maintenance_phone);
+  const { name, email, twilio_number, password, plan, plumbing, electrical, hvac, structural, pest, security, appliances, general } = req.body;
+  const contacts = { plumbing, electrical, hvac, structural, pest, security, appliances, general };
+  await createManager(name, email, twilio_number, password, plan, contacts);
   console.log(`[ADMIN] New manager created: ${name} | ${twilio_number}`);
 
   const PLAN_PRICES = { starter: 149, growth: 299, pro: 599 };
@@ -821,6 +837,74 @@ app.post("/admin/managers/:id/delete", checkAdminAuth, async (req, res) => {
   await pool.query("DELETE FROM tenants WHERE manager_id = $1", [id]);
   await pool.query("DELETE FROM managers WHERE id = $1", [id]);
   console.log(`[ADMIN] Manager ${id} deleted`);
+  res.redirect("/admin");
+});
+
+app.get("/admin/managers/:id/contacts", checkAdminAuth, async (req, res) => {
+  const manager = await getManagerById(parseInt(req.params.id));
+  if (!manager) return res.redirect("/admin");
+
+  const contacts = await pool.query(
+    "SELECT * FROM maintenance_contacts WHERE manager_id = $1 ORDER BY category",
+    [manager.id]
+  );
+  const contactMap = {};
+  contacts.rows.forEach(c => { contactMap[c.category] = c; });
+
+  const categories = [
+    { key: "plumbing", label: "🔧 Plumbing" },
+    { key: "electrical", label: "⚡ Electrical" },
+    { key: "hvac", label: "❄️ HVAC" },
+    { key: "structural", label: "🪟 Structural" },
+    { key: "pest", label: "🐛 Pest Control" },
+    { key: "security", label: "🔒 Security" },
+    { key: "appliances", label: "🏠 Appliances" },
+    { key: "general", label: "🧹 General" },
+  ];
+
+  const fields = categories.map(c => `
+    <div>
+      <label style="font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px">${c.label}</label>
+      <input name="${c.key}" value="${contactMap[c.key]?.phone || ""}" placeholder="+15551234567"
+        style="width:100%;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none">
+    </div>
+  `).join("");
+
+  res.send(`
+    <html><head><title>Edit Contacts — ${manager.name}</title><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;padding:40px 32px;color:#1e293b;}
+    .card{background:white;border-radius:16px;padding:32px;max-width:700px;margin:0 auto;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+    h1{font-size:22px;margin-bottom:6px;}p{font-size:14px;color:#64748b;margin-bottom:28px;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px;}
+    button{padding:12px 24px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin-right:8px;}
+    a.back{font-size:14px;color:#64748b;text-decoration:none;}
+    </style></head><body>
+    <div class="card">
+      <h1>Edit Maintenance Contacts</h1>
+      <p>Client: ${manager.name} | Number: ${manager.twilio_number}</p>
+      <form method="POST" action="/admin/managers/${manager.id}/contacts">
+        <div class="grid">${fields}</div>
+        <button type="submit">Save Contacts</button>
+        <a href="/admin" class="back">Cancel</a>
+      </form>
+    </div>
+    </body></html>
+  `);
+});
+
+app.post("/admin/managers/:id/contacts", checkAdminAuth, async (req, res) => {
+  const managerId = parseInt(req.params.id);
+  const categories = ["plumbing", "electrical", "hvac", "structural", "pest", "security", "appliances", "general"];
+  for (const cat of categories) {
+    const phone = req.body[cat];
+    if (phone) {
+      await pool.query(
+        "UPDATE maintenance_contacts SET phone = $1 WHERE manager_id = $2 AND category = $3",
+        [phone, managerId, cat]
+      );
+    }
+  }
+  console.log(`[ADMIN] Maintenance contacts updated for manager ${managerId}`);
   res.redirect("/admin");
 });
 
