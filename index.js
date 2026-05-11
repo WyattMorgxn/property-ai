@@ -950,25 +950,270 @@ app.get("/dashboard/logout", (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// HOMEPAGE
+// HOMEPAGE — MARKETING LANDING PAGE
 // ─────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.status(200).send(
-    '<html><head><title>Tenant Flow AI</title><style>body{font-family:Arial,sans-serif;background:#f5f7fb;text-align:center;padding:60px;color:#333;}h1{font-size:42px;margin-bottom:10px;}p{font-size:18px;max-width:900px;margin:12px auto;line-height:1.6;}.section-title{font-weight:bold;margin-top:30px;font-size:20px;}.owner{margin-top:25px;font-weight:bold;}.contact{margin-top:20px;font-weight:bold;}.links{margin-top:25px;}.links a{margin:0 10px;color:#2563eb;text-decoration:none;font-weight:bold;}footer{margin-top:60px;font-size:14px;color:#777;}</style></head><body>' +
-    '<h1>Tenant Flow AI</h1><p>AI-powered tenant maintenance communication platform for property managers.</p>' +
-    '<p>Tenants can report maintenance issues via SMS. The system collects all details and automatically dispatches the right maintenance person.</p>' +
-    '<p class="section-title">How It Works</p>' +
-    '<p>Tenants text their issue. Tenant Flow AI collects the issue details, unit address, and availability — then contacts the right maintenance person directly.</p>' +
-    '<p class="section-title">How to Get Started</p>' +
-    '<p>Text the Tenant Flow AI phone number to report a maintenance issue. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p>' +
-    '<p class="section-title">SMS Consent and Compliance</p>' +
-    '<p>Users opt in by initiating contact via text message. No marketing messages are sent through this program.</p>' +
-    '<p class="owner">Tenant Flow AI is owned and operated by Wyatt D Morgan.</p>' +
-    '<p>Business Location: United States</p><p>Service Type: Property Management Communication Software</p>' +
-    '<p class="contact">Contact: wyattmorgan@tenant-flow-ai.com</p>' +
-    '<div class="links"><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms and Conditions</a> | <a href="/dashboard">Dashboard</a></div>' +
-    '<footer>&copy; 2026 Tenant Flow AI</footer></body></html>'
-  );
+  res.status(200).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tenant Flow AI — AI-Powered Maintenance for Property Managers</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; color: #1e293b; background: white; }
+
+    /* NAV */
+    nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; background: rgba(255,255,255,0.95); backdrop-filter: blur(8px); border-bottom: 1px solid #e2e8f0; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
+    .nav-logo { font-size: 20px; font-weight: 800; color: #1e293b; text-decoration: none; }
+    .nav-logo span { color: #22c55e; }
+    .nav-links { display: flex; align-items: center; gap: 24px; }
+    .nav-links a { font-size: 14px; color: #64748b; text-decoration: none; font-weight: 500; }
+    .nav-links a:hover { color: #1e293b; }
+    .nav-cta { background: #1e293b; color: white !important; padding: 10px 20px; border-radius: 8px; font-weight: 700 !important; font-size: 14px !important; }
+    .nav-cta:hover { background: #334155 !important; color: white !important; }
+
+    /* HERO */
+    .hero { padding: 140px 32px 80px; text-align: center; background: linear-gradient(180deg, #f8fafc 0%, white 100%); }
+    .hero-badge { display: inline-flex; align-items: center; gap: 8px; background: #dcfce7; color: #15803d; padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 700; margin-bottom: 24px; }
+    .hero-badge::before { content: "●"; color: #22c55e; }
+    .hero h1 { font-size: clamp(36px, 6vw, 64px); font-weight: 800; line-height: 1.1; color: #0f172a; max-width: 800px; margin: 0 auto 24px; }
+    .hero h1 span { color: #22c55e; }
+    .hero p { font-size: clamp(16px, 2vw, 20px); color: #64748b; max-width: 600px; margin: 0 auto 40px; line-height: 1.6; }
+    .hero-btns { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    .btn-primary { background: #1e293b; color: white; padding: 16px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; transition: background 0.2s; }
+    .btn-primary:hover { background: #334155; }
+    .btn-secondary { background: white; color: #1e293b; padding: 16px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; text-decoration: none; border: 2px solid #e2e8f0; transition: border-color 0.2s; }
+    .btn-secondary:hover { border-color: #94a3b8; }
+
+    /* PHONE MOCKUP */
+    .mockup-section { padding: 40px 32px 80px; display: flex; justify-content: center; }
+    .phone { background: #1e293b; border-radius: 40px; padding: 24px 16px; width: 280px; box-shadow: 0 40px 80px rgba(0,0,0,0.2); }
+    .phone-screen { background: #f1f5f9; border-radius: 28px; padding: 20px 16px; min-height: 380px; }
+    .phone-header { text-align: center; font-size: 13px; font-weight: 700; color: #1e293b; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0; }
+    .msg { margin-bottom: 12px; }
+    .msg-bubble { padding: 10px 14px; border-radius: 18px; font-size: 13px; line-height: 1.4; max-width: 85%; }
+    .msg.tenant { display: flex; justify-content: flex-end; }
+    .msg.tenant .msg-bubble { background: #1e293b; color: white; border-bottom-right-radius: 4px; }
+    .msg.ai .msg-bubble { background: white; color: #1e293b; border-bottom-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .msg-label { font-size: 10px; color: #94a3b8; margin-bottom: 4px; text-align: right; }
+    .msg.ai .msg-label { text-align: left; }
+
+    /* STATS */
+    .stats-bar { background: #1e293b; padding: 48px 32px; }
+    .stats-inner { max-width: 900px; margin: 0 auto; display: flex; gap: 48px; justify-content: center; flex-wrap: wrap; text-align: center; }
+    .stat-item .num { font-size: 48px; font-weight: 800; color: #22c55e; }
+    .stat-item .label { font-size: 15px; color: #94a3b8; margin-top: 4px; }
+
+    /* HOW IT WORKS */
+    .section { padding: 80px 32px; max-width: 1100px; margin: 0 auto; }
+    .section-label { font-size: 13px; font-weight: 700; color: #22c55e; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 12px; }
+    .section h2 { font-size: clamp(28px, 4vw, 44px); font-weight: 800; color: #0f172a; margin-bottom: 16px; }
+    .section > p { font-size: 18px; color: #64748b; max-width: 600px; margin-bottom: 56px; line-height: 1.6; }
+    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 32px; }
+    .step { background: #f8fafc; border-radius: 16px; padding: 28px; border: 1px solid #e2e8f0; }
+    .step-num { width: 40px; height: 40px; background: #1e293b; color: white; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 800; margin-bottom: 16px; }
+    .step h3 { font-size: 18px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
+    .step p { font-size: 14px; color: #64748b; line-height: 1.6; }
+
+    /* FEATURES */
+    .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; }
+    .feature { background: white; border: 1px solid #e2e8f0; border-radius: 16px; padding: 28px; transition: box-shadow 0.2s; }
+    .feature:hover { box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+    .feature-icon { font-size: 32px; margin-bottom: 16px; }
+    .feature h3 { font-size: 17px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
+    .feature p { font-size: 14px; color: #64748b; line-height: 1.6; }
+
+    /* PRICING */
+    .pricing-section { background: #f8fafc; padding: 80px 32px; }
+    .pricing-inner { max-width: 900px; margin: 0 auto; text-align: center; }
+    .pricing-inner .section-label { display: block; margin-bottom: 12px; }
+    .pricing-inner h2 { font-size: clamp(28px, 4vw, 44px); font-weight: 800; color: #0f172a; margin-bottom: 16px; }
+    .pricing-inner > p { font-size: 18px; color: #64748b; margin-bottom: 48px; }
+    .pricing-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 24px; text-align: left; }
+    .pricing-card { background: white; border: 2px solid #e2e8f0; border-radius: 20px; padding: 32px; }
+    .pricing-card.popular { border-color: #22c55e; position: relative; }
+    .popular-badge { position: absolute; top: -14px; left: 50%; transform: translateX(-50%); background: #22c55e; color: white; font-size: 12px; font-weight: 700; padding: 4px 16px; border-radius: 20px; white-space: nowrap; }
+    .pricing-card h3 { font-size: 20px; font-weight: 800; color: #0f172a; margin-bottom: 4px; }
+    .pricing-card .price { font-size: 48px; font-weight: 800; color: #0f172a; margin: 16px 0 4px; }
+    .pricing-card .price span { font-size: 16px; color: #64748b; font-weight: 400; }
+    .pricing-card .units { font-size: 14px; color: #64748b; margin-bottom: 24px; }
+    .pricing-card ul { list-style: none; margin-bottom: 32px; }
+    .pricing-card li { font-size: 14px; color: #374151; padding: 6px 0; display: flex; align-items: center; gap: 8px; }
+    .pricing-card li::before { content: "✓"; color: #22c55e; font-weight: 700; }
+    .btn-plan { display: block; text-align: center; padding: 14px; border-radius: 10px; font-size: 15px; font-weight: 700; text-decoration: none; background: #1e293b; color: white; }
+    .btn-plan.green { background: #22c55e; }
+    .btn-plan:hover { opacity: 0.9; }
+
+    /* TESTIMONIAL */
+    .testimonial-section { padding: 80px 32px; max-width: 800px; margin: 0 auto; text-align: center; }
+    .quote { font-size: clamp(20px, 3vw, 28px); font-weight: 600; color: #0f172a; line-height: 1.5; margin-bottom: 24px; font-style: italic; }
+    .quote-author { font-size: 15px; color: #64748b; }
+
+    /* CTA */
+    .cta-section { background: #1e293b; padding: 80px 32px; text-align: center; }
+    .cta-section h2 { font-size: clamp(28px, 4vw, 48px); font-weight: 800; color: white; margin-bottom: 16px; }
+    .cta-section p { font-size: 18px; color: #94a3b8; margin-bottom: 40px; }
+    .btn-cta { background: #22c55e; color: white; padding: 18px 40px; border-radius: 12px; font-size: 18px; font-weight: 700; text-decoration: none; display: inline-block; transition: background 0.2s; }
+    .btn-cta:hover { background: #16a34a; }
+
+    /* FOOTER */
+    footer { background: #0f172a; padding: 32px; text-align: center; }
+    footer p { font-size: 13px; color: #475569; }
+    footer a { color: #64748b; text-decoration: none; margin: 0 8px; }
+    footer a:hover { color: #94a3b8; }
+  </style>
+</head>
+<body>
+
+  <!-- NAV -->
+  <nav>
+    <a href="/" class="nav-logo">Tenant Flow <span>AI</span></a>
+    <div class="nav-links">
+      <a href="#how-it-works">How It Works</a>
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="https://calendly.com/morgaw23/30min" target="_blank" class="nav-cta">Book a Demo</a>
+    </div>
+  </nav>
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="hero-badge">AI-Powered Property Management</div>
+    <h1>Stop Answering <span>Maintenance Calls.</span> Let AI Handle It.</h1>
+    <p>Tenant Flow AI handles every maintenance request automatically — from the first text to dispatching the right technician. No calls. No back and forth. Just results.</p>
+    <div class="hero-btns">
+      <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-primary">📅 Book a Free Demo</a>
+      <a href="#how-it-works" class="btn-secondary">See How It Works</a>
+    </div>
+  </div>
+
+  <!-- PHONE MOCKUP -->
+  <div class="mockup-section">
+    <div class="phone">
+      <div class="phone-screen">
+        <div class="phone-header">Tenant Flow AI</div>
+        <div class="msg tenant"><div><div class="msg-label">Tenant</div><div class="msg-bubble">My kitchen sink is leaking badly</div></div></div>
+        <div class="msg ai"><div><div class="msg-label">Tenant Flow AI</div><div class="msg-bubble">Got it! A leaking sink needs quick attention. What's your unit address?</div></div></div>
+        <div class="msg tenant"><div><div class="msg-label">Tenant</div><div class="msg-bubble">324 Warner St Apt 2</div></div></div>
+        <div class="msg ai"><div><div class="msg-label">Tenant Flow AI</div><div class="msg-bubble">When would work best for a technician to come by?</div></div></div>
+        <div class="msg tenant"><div><div class="msg-label">Tenant</div><div class="msg-bubble">Tomorrow morning</div></div></div>
+        <div class="msg ai"><div><div class="msg-label">Tenant Flow AI</div><div class="msg-bubble">You're all set! A plumber will reach out to confirm your appointment. 🔧</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STATS -->
+  <div class="stats-bar">
+    <div class="stats-inner">
+      <div class="stat-item"><div class="num">24/7</div><div class="label">Always available for tenants</div></div>
+      <div class="stat-item"><div class="num">2 min</div><div class="label">Average response time</div></div>
+      <div class="stat-item"><div class="num">0</div><div class="label">Calls you have to take</div></div>
+      <div class="stat-item"><div class="num">100%</div><div class="label">Requests tracked & logged</div></div>
+    </div>
+  </div>
+
+  <!-- HOW IT WORKS -->
+  <div class="section" id="how-it-works">
+    <div class="section-label">How It Works</div>
+    <h2>From tenant text to technician dispatched — automatically.</h2>
+    <p>No apps to download. No portals to log into. Just a phone number your tenants text.</p>
+    <div class="steps">
+      <div class="step"><div class="step-num">1</div><h3>Tenant Texts In</h3><p>Tenant texts your dedicated number describing their issue. No app needed — just a normal text message.</p></div>
+      <div class="step"><div class="step-num">2</div><h3>AI Collects Details</h3><p>Tenant Flow AI asks follow-up questions to get the address, issue details, and availability. All automatically.</p></div>
+      <div class="step"><div class="step-num">3</div><h3>Right Tech Gets Alerted</h3><p>The system classifies the issue — plumbing, electrical, HVAC, etc. — and texts the right maintenance person immediately.</p></div>
+      <div class="step"><div class="step-num">4</div><h3>Tenant Gets Updated</h3><p>When the tech responds, the tenant automatically gets a status update. Everyone stays in the loop without you lifting a finger.</p></div>
+    </div>
+  </div>
+
+  <!-- FEATURES -->
+  <div class="section" id="features">
+    <div class="section-label">Features</div>
+    <h2>Everything you need. Nothing you don't.</h2>
+    <p>Built specifically for property managers who are tired of being the middleman.</p>
+    <div class="features-grid">
+      <div class="feature"><div class="feature-icon">🤖</div><h3>AI-Powered Conversations</h3><p>Claude AI handles every tenant interaction naturally — asking the right questions and collecting everything needed to dispatch the right person.</p></div>
+      <div class="feature"><div class="feature-icon">🔧</div><h3>Smart Maintenance Routing</h3><p>Issues are automatically categorized — plumbing, electrical, HVAC, structural, pest control, appliances — and routed to the right team.</p></div>
+      <div class="feature"><div class="feature-icon">🚨</div><h3>Emergency Detection</h3><p>Gas leaks, flooding, and electrical hazards are flagged as emergencies and escalated immediately — no delay.</p></div>
+      <div class="feature"><div class="feature-icon">📊</div><h3>Real-Time Dashboard</h3><p>See all active requests, track urgency levels, update statuses, and manage your entire portfolio from one clean dashboard.</p></div>
+      <div class="feature"><div class="feature-icon">💬</div><h3>Two-Way Status Updates</h3><p>Maintenance techs text back their status — Done, Scheduled, On My Way — and tenants get automatically notified.</p></div>
+      <div class="feature"><div class="feature-icon">📱</div><h3>Works on Any Phone</h3><p>No app downloads. No tenant training required. Just a phone number they text — exactly like texting a friend.</p></div>
+    </div>
+  </div>
+
+  <!-- PRICING -->
+  <div class="pricing-section" id="pricing">
+    <div class="pricing-inner">
+      <span class="section-label">Pricing</span>
+      <h2>Simple, transparent pricing.</h2>
+      <p>Pay for what you need. Scale as you grow. Cancel anytime.</p>
+      <div class="pricing-cards">
+        <div class="pricing-card">
+          <h3>Starter</h3>
+          <div class="price">$149<span>/mo</span></div>
+          <div class="units">Up to 25 units</div>
+          <ul>
+            <li>AI maintenance handling</li>
+            <li>Smart issue routing</li>
+            <li>Real-time dashboard</li>
+            <li>Dedicated phone number</li>
+            <li>Emergency detection</li>
+          </ul>
+          <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-plan">Book a Demo</a>
+        </div>
+        <div class="pricing-card popular">
+          <div class="popular-badge">Most Popular</div>
+          <h3>Growth</h3>
+          <div class="price">$299<span>/mo</span></div>
+          <div class="units">Up to 100 units</div>
+          <ul>
+            <li>Everything in Starter</li>
+            <li>Multiple maintenance teams</li>
+            <li>Priority support</li>
+            <li>Advanced status tracking</li>
+            <li>Full request history</li>
+          </ul>
+          <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-plan green">Book a Demo</a>
+        </div>
+        <div class="pricing-card">
+          <h3>Pro</h3>
+          <div class="price">$599<span>/mo</span></div>
+          <div class="units">Unlimited units</div>
+          <ul>
+            <li>Everything in Growth</li>
+            <li>Unlimited properties</li>
+            <li>Custom setup & onboarding</li>
+            <li>Dedicated account manager</li>
+            <li>White glove support</li>
+          </ul>
+          <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-plan">Book a Demo</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CTA -->
+  <div class="cta-section">
+    <h2>Ready to stop answering maintenance calls?</h2>
+    <p>Book a free 30-minute demo and see Tenant Flow AI in action.</p>
+    <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-cta">📅 Book Your Free Demo</a>
+  </div>
+
+  <!-- FOOTER -->
+  <footer>
+    <p>
+      &copy; 2026 Tenant Flow AI. Owned and operated by Wyatt D Morgan.
+      &nbsp;|&nbsp;
+      <a href="/privacy">Privacy Policy</a>
+      <a href="/terms">Terms</a>
+      <a href="/dashboard/login">Client Login</a>
+    </p>
+  </footer>
+
+</body>
+</html>
+  `);
 });
 
 // ─────────────────────────────────────────────
