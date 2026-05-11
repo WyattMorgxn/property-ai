@@ -53,17 +53,34 @@ async function initDb() {
   `);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id)`).catch(() => {});
 
-  // Create or update conversations table
+  // Fix conversations table — drop old primary key and use composite key
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversations (
-      phone TEXT PRIMARY KEY,
+      phone TEXT NOT NULL,
+      manager_id INTEGER REFERENCES managers(id),
       messages JSONB DEFAULT '[]',
       resolved BOOLEAN DEFAULT false,
       updated_at TIMESTAMPTZ DEFAULT NOW(),
-      manager_id INTEGER REFERENCES managers(id)
+      PRIMARY KEY (phone, manager_id)
     );
-  `);
-  await pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id)`).catch(() => {});
+  `).catch(async () => {
+    // Table exists — migrate to composite key if needed
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'conversations_pkey'
+          AND contype = 'p'
+          AND array_length(conkey, 1) = 2
+        ) THEN
+          ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_pkey;
+          ALTER TABLE conversations ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id);
+          ALTER TABLE conversations ADD PRIMARY KEY (phone, manager_id);
+        END IF;
+      END $$;
+    `).catch(() => {});
+  });
 
   // Create or update requests table
   await pool.query(`
@@ -257,7 +274,11 @@ async function getTenantByAddress(managerId, addressFragment) {
 async function getConversation(phone, managerId) {
   const res = await pool.query("SELECT * FROM conversations WHERE phone = $1 AND manager_id = $2", [phone, managerId]);
   if (res.rows[0]) return res.rows[0];
-  await pool.query("INSERT INTO conversations (phone, manager_id, messages, resolved) VALUES ($1, $2, '[]', false)", [phone, managerId]);
+  await pool.query(`
+    INSERT INTO conversations (phone, manager_id, messages, resolved)
+    VALUES ($1, $2, '[]', false)
+    ON CONFLICT (phone, manager_id) DO NOTHING
+  `, [phone, managerId]);
   return { phone, manager_id: managerId, messages: [], resolved: false };
 }
 
