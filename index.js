@@ -743,7 +743,66 @@ app.post("/admin/managers", checkAdminAuth, async (req, res) => {
   const { name, email, twilio_number, password, maintenance_phone, plan } = req.body;
   await createManager(name, email, twilio_number, password, plan, maintenance_phone);
   console.log(`[ADMIN] New manager created: ${name} | ${twilio_number}`);
-  res.redirect("/admin");
+
+  const PLAN_PRICES = { starter: 149, growth: 299, pro: 599 };
+  const planLabel = plan.charAt(0).toUpperCase() + plan.slice(1);
+  const price = PLAN_PRICES[plan] || 0;
+
+  res.send(`
+    <html><head><title>Client Added</title><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
+    .card{background:white;border-radius:16px;padding:40px;width:100%;max-width:560px;box-shadow:0 4px 24px rgba(0,0,0,0.08);}
+    .check{width:56px;height:56px;background:#22c55e;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:20px;}
+    .check svg{width:28px;height:28px;}
+    h1{font-size:24px;color:#1e293b;margin-bottom:8px;}
+    p.sub{font-size:15px;color:#64748b;margin-bottom:28px;}
+    .info-box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin-bottom:24px;}
+    .info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #e2e8f0;}
+    .info-row:last-child{border-bottom:none;}
+    .info-label{font-size:13px;color:#64748b;font-weight:bold;}
+    .info-value{font-size:14px;color:#1e293b;font-weight:bold;}
+    .info-value code{background:#e2e8f0;padding:3px 8px;border-radius:4px;font-size:13px;}
+    .copy-box{background:#1e293b;color:#e2e8f0;border-radius:12px;padding:20px;margin-bottom:24px;font-size:13px;line-height:1.8;white-space:pre-wrap;}
+    .copy-box strong{color:white;}
+    .btn{display:inline-block;padding:12px 24px;background:#1e293b;color:white;text-decoration:none;border-radius:8px;font-size:14px;font-weight:bold;margin-right:8px;}
+    .btn.green{background:#22c55e;}
+    button.copy-btn{padding:10px 20px;background:#3b82f6;color:white;border:none;border-radius:8px;font-size:13px;font-weight:bold;cursor:pointer;margin-bottom:20px;width:100%;}
+    </style></head><body>
+    <div class="card">
+      <div class="check"><svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
+      <h1>Client Added Successfully!</h1>
+      <p class="sub">Here are the login credentials for ${name}. Copy and send them now.</p>
+
+      <div class="info-box">
+        <div class="info-row"><span class="info-label">Name</span><span class="info-value">${name}</span></div>
+        <div class="info-row"><span class="info-label">Dashboard URL</span><span class="info-value"><code>tenant-flow-ai.com/dashboard/login</code></span></div>
+        <div class="info-row"><span class="info-label">Login Phone</span><span class="info-value"><code>${twilio_number}</code></span></div>
+        <div class="info-row"><span class="info-label">Password</span><span class="info-value"><code>${password}</code></span></div>
+        <div class="info-row"><span class="info-label">Plan</span><span class="info-value">${planLabel} — $${price}/mo</span></div>
+        <div class="info-row"><span class="info-label">Tenant SMS Number</span><span class="info-value"><code>${twilio_number}</code></span></div>
+      </div>
+
+      <p style="font-size:13px;color:#64748b;margin-bottom:12px;font-weight:bold">Copy this message to send to your client:</p>
+      <div class="copy-box" id="msg"><strong>Welcome to Tenant Flow AI, ${name}!</strong>
+
+Your account is ready. Here is how to get started:
+
+Dashboard Login: tenant-flow-ai.com/dashboard/login
+Phone Number: ${twilio_number}
+Password: ${password}
+
+Your tenants can start texting ${twilio_number} to report maintenance issues right away.
+
+Plan: ${planLabel} ($${price}/month)
+
+Questions? Reply to this message or email wyattmorgan@tenant-flow-ai.com</div>
+
+      <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('msg').innerText).then(()=>{this.textContent='Copied!';this.style.background='#22c55e';})">Copy Message to Clipboard</button>
+
+      <a href="/admin" class="btn">Back to Admin</a>
+    </div>
+    </body></html>
+  `);
 });
 
 app.post("/admin/managers/:id/plan", checkAdminAuth, async (req, res) => {
