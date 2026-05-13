@@ -1231,53 +1231,36 @@ app.get("/", (req, res) => {
     </div>
   </div>
 
-  <!-- PRICING -->
+  <!-- PRICING REPLACED WITH CTA -->
   <div class="pricing-section" id="pricing">
     <div class="pricing-inner">
       <span class="section-label">Pricing</span>
-      <h2>Simple, transparent pricing.</h2>
-      <p>Pay for what you need. Scale as you grow. Cancel anytime.</p>
-      <div class="pricing-cards">
-        <div class="pricing-card">
-          <h3>Starter</h3>
-          <div class="price">$149<span>/mo</span></div>
-          <div class="units">Up to 25 units</div>
-          <ul>
-            <li>AI maintenance handling</li>
-            <li>Smart issue routing</li>
-            <li>Real-time dashboard</li>
-            <li>Dedicated phone number</li>
-            <li>Emergency detection</li>
-          </ul>
-          <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-plan">Book a Demo</a>
+      <h2>Custom pricing for your portfolio.</h2>
+      <p>Every property management operation is different. Book a free demo and we'll build a plan around your portfolio size, team, and goals.</p>
+
+      <div style="display:flex;gap:32px;justify-content:center;flex-wrap:wrap;margin-bottom:48px;">
+        <div style="background:white;border-radius:16px;padding:28px 32px;flex:1;min-width:220px;max-width:300px;box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;">
+          <div style="font-size:36px;margin-bottom:12px;">🏢</div>
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;">Small Portfolios</h3>
+          <p style="font-size:14px;color:#64748b;line-height:1.6;">Perfect for independent landlords and small property managers with a handful of units.</p>
         </div>
-        <div class="pricing-card popular">
-          <div class="popular-badge">Most Popular</div>
-          <h3>Growth</h3>
-          <div class="price">$299<span>/mo</span></div>
-          <div class="units">Up to 100 units</div>
-          <ul>
-            <li>Everything in Starter</li>
-            <li>Multiple maintenance teams</li>
-            <li>Priority support</li>
-            <li>Advanced status tracking</li>
-            <li>Full request history</li>
-          </ul>
-          <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-plan green">Book a Demo</a>
+        <div style="background:white;border-radius:16px;padding:28px 32px;flex:1;min-width:220px;max-width:300px;box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;border:2px solid #22c55e;">
+          <div style="font-size:36px;margin-bottom:12px;">🏙️</div>
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;">Growing Portfolios</h3>
+          <p style="font-size:14px;color:#64748b;line-height:1.6;">Ideal for property managers scaling up with multiple properties and maintenance teams.</p>
         </div>
-        <div class="pricing-card">
-          <h3>Pro</h3>
-          <div class="price">$599<span>/mo</span></div>
-          <div class="units">Unlimited units</div>
-          <ul>
-            <li>Everything in Growth</li>
-            <li>Unlimited properties</li>
-            <li>Custom setup & onboarding</li>
-            <li>Dedicated account manager</li>
-            <li>White glove support</li>
-          </ul>
-          <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-plan">Book a Demo</a>
+        <div style="background:white;border-radius:16px;padding:28px 32px;flex:1;min-width:220px;max-width:300px;box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;">
+          <div style="font-size:36px;margin-bottom:12px;">🏗️</div>
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;">Large Operations</h3>
+          <p style="font-size:14px;color:#64748b;line-height:1.6;">Built for large property management companies with hundreds of units and multiple managers.</p>
         </div>
+      </div>
+
+      <div style="background:#1e293b;border-radius:16px;padding:40px;text-align:center;">
+        <h3 style="font-size:26px;font-weight:800;color:white;margin-bottom:12px;">See exactly what it costs for your portfolio</h3>
+        <p style="font-size:16px;color:#94a3b8;margin-bottom:28px;max-width:500px;margin-left:auto;margin-right:auto;">No sales pressure. Just a free 30-minute demo where we show you the product live and build a custom quote around your operation.</p>
+        <a href="https://calendly.com/morgaw23/30min" target="_blank" style="display:inline-block;background:#22c55e;color:white;padding:16px 36px;border-radius:10px;font-size:16px;font-weight:700;text-decoration:none;">📅 Book Your Free Demo</a>
+        <p style="font-size:13px;color:#475569;margin-top:16px;">No commitment. No credit card. Just 30 minutes.</p>
       </div>
     </div>
   </div>
