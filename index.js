@@ -1265,6 +1265,58 @@ app.get("/", (req, res) => {
     </div>
   </div>
 
+  <!-- FAQ -->
+  <div style="padding:80px 32px;background:#f8fafc;">
+    <div style="max-width:800px;margin:0 auto;">
+      <p style="font-size:13px;font-weight:700;color:#22c55e;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:12px;">FAQ</p>
+      <h2 style="font-size:clamp(28px,4vw,44px);font-weight:800;color:#0f172a;margin-bottom:48px;">Common questions answered.</h2>
+
+      <div style="display:flex;flex-direction:column;gap:16px;">
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">Do tenants need to download an app?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">No — tenants just send a normal text message to a dedicated phone number. Nothing to download, no account to create, no portal to log into. If they can text a friend they can use Tenant Flow AI.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">Do I have to replace my current property management software?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">Not at all. Tenant Flow AI runs alongside whatever you already use for rent collection, leases, and accounting. We specifically handle the maintenance communication piece — the part that's eating your time.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">What happens if there's an emergency like a gas leak or flooding?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">Tenant Flow AI automatically detects emergency keywords and escalates immediately — skipping the normal availability questions and alerting your maintenance team right away. No delay, no waiting.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">How long does setup take?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">Under 10 minutes. We set up your dedicated phone number, add your maintenance contacts, and you're live. Tenants can start texting the same day.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">What types of maintenance issues does it handle?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">Everything — plumbing, electrical, HVAC, structural, pest control, security, appliances, and general maintenance. The AI automatically categorizes the issue and routes it to the right person on your team.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">How does the maintenance person get notified?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">They get a text message with everything they need — the property address, tenant phone number, issue description, and tenant availability. They can then contact the tenant directly to confirm the appointment.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">What if the AI misunderstands something?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">Every conversation is logged and visible in your dashboard in real time. You can see exactly what was said and step in at any point. In practice the AI handles the vast majority of requests accurately.</p>
+        </div>
+
+        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
+          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">Is there a contract or commitment?</h3>
+          <p style="font-size:15px;color:#64748b;line-height:1.7;">No contracts. No long-term commitments. You can cancel anytime. We're confident you'll stay because the product saves you real time every single week.</p>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
   <!-- CTA -->
   <div class="cta-section">
     <h2>Ready to stop answering maintenance calls?</h2>
