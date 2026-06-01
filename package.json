@@ -1,14 +1,15 @@
 {
-  "name": "property-ai",
+  "name": "staypilot",
   "version": "1.0.0",
-  "type": "module",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "nodemailer": "^6.9.0",
-    "pg": "^8.11.0"
+    "nodemailer": "^6.9.7",
+    "pg": "^8.11.3",
+    "node-ical": "^0.18.0"
   }
 }
