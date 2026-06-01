@@ -1,6 +1,7 @@
 import express from "express";
 import nodemailer from "nodemailer";
 import pg from "pg";
+import * as ical from "node-ical";
 
 const { Pool } = pg;
 const app = express();
@@ -16,7 +17,7 @@ const pool = new Pool({
 });
 
 async function initDb() {
-  // Create managers table
+  // ── EXISTING TABLES ──────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS managers (
       id SERIAL PRIMARY KEY,
@@ -29,7 +30,6 @@ async function initDb() {
     );
   `);
 
-  // Create maintenance contacts table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS maintenance_contacts (
       id SERIAL PRIMARY KEY,
@@ -40,7 +40,6 @@ async function initDb() {
     );
   `);
 
-  // Create or update tenants table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tenants (
       phone TEXT PRIMARY KEY,
@@ -53,7 +52,6 @@ async function initDb() {
   `);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id)`).catch(() => {});
 
-  // Fix conversations table — drop and recreate with composite primary key
   await pool.query(`DROP TABLE IF EXISTS conversations CASCADE`);
   await pool.query(`
     CREATE TABLE conversations (
@@ -66,7 +64,6 @@ async function initDb() {
     );
   `);
 
-  // Create or update requests table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS requests (
       id SERIAL PRIMARY KEY,
@@ -84,7 +81,106 @@ async function initDb() {
   `);
   await pool.query(`ALTER TABLE requests ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES managers(id)`).catch(() => {});
 
-  // Seed Wyatt as first manager
+  // ── NEW STR TABLES ───────────────────────────
+
+  // STR hosts — each host gets their own Twilio number (same pattern as managers)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS str_hosts (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT,
+      twilio_number TEXT UNIQUE NOT NULL,
+      dashboard_password TEXT NOT NULL,
+      host_phone TEXT NOT NULL,
+      plan TEXT DEFAULT 'starter',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Properties — each property belongs to a host, has a knowledge base
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS str_properties (
+      id SERIAL PRIMARY KEY,
+      host_id INTEGER REFERENCES str_hosts(id) ON DELETE CASCADE,
+      name TEXT,
+      address TEXT NOT NULL,
+      address_normalized TEXT,
+      ical_url TEXT,
+      ical_url_2 TEXT,
+      wifi_name TEXT,
+      wifi_password TEXT,
+      door_code TEXT,
+      checkin_time TEXT DEFAULT '3:00 PM',
+      checkout_time TEXT DEFAULT '11:00 AM',
+      parking_instructions TEXT,
+      key_dropoff TEXT,
+      thermostat_instructions TEXT,
+      washer_dryer_instructions TEXT,
+      tv_instructions TEXT,
+      trash_instructions TEXT,
+      house_rules TEXT,
+      quiet_hours_start INTEGER DEFAULT 22,
+      quiet_hours_end INTEGER DEFAULT 8,
+      breaker_location TEXT,
+      water_shutoff TEXT,
+      nearest_urgent_care TEXT,
+      local_restaurants TEXT,
+      local_grocery TEXT,
+      local_coffee TEXT,
+      local_activities TEXT,
+      extra_notes TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Bookings — populated by iCal sync
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS str_bookings (
+      id SERIAL PRIMARY KEY,
+      property_id INTEGER REFERENCES str_properties(id) ON DELETE CASCADE,
+      host_id INTEGER REFERENCES str_hosts(id) ON DELETE CASCADE,
+      checkin_date DATE NOT NULL,
+      checkout_date DATE NOT NULL,
+      guest_name TEXT,
+      ical_uid TEXT,
+      status TEXT DEFAULT 'upcoming',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(property_id, ical_uid)
+    );
+  `);
+
+  // Guests — linked when they text in and confirm address
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS str_guests (
+      id SERIAL PRIMARY KEY,
+      phone TEXT NOT NULL,
+      property_id INTEGER REFERENCES str_properties(id),
+      booking_id INTEGER REFERENCES str_bookings(id),
+      host_id INTEGER REFERENCES str_hosts(id),
+      onboarding_state TEXT DEFAULT 'awaiting_address',
+      pending_property_id INTEGER,
+      opted_out BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(phone, host_id)
+    );
+  `);
+
+  // STR Conversations — per guest per host
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS str_conversations (
+      id SERIAL PRIMARY KEY,
+      guest_phone TEXT NOT NULL,
+      host_id INTEGER REFERENCES str_hosts(id),
+      property_id INTEGER REFERENCES str_properties(id),
+      messages JSONB DEFAULT '[]',
+      escalated BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(guest_phone, host_id)
+    );
+  `);
+
+  // ── SEED EXISTING MANAGER ────────────────────
   const existing = await pool.query("SELECT id FROM managers WHERE twilio_number = $1", ["+15139518826"]);
   let wyattId;
   if (existing.rows.length === 0) {
@@ -93,8 +189,6 @@ async function initDb() {
       VALUES ($1, $2, $3, $4, $5) RETURNING id
     `, ["Wyatt Morgan", "wyattmorgan@tenant-flow-ai.com", "+15139518826", "Tenaro", "pro"]);
     wyattId = res.rows[0].id;
-
-    // Seed Wyatt's maintenance contacts
     const categories = ["plumbing", "electrical", "hvac", "structural", "pest", "security", "appliances", "general"];
     for (const cat of categories) {
       await pool.query(
@@ -106,16 +200,626 @@ async function initDb() {
     wyattId = existing.rows[0].id;
   }
 
-  // Migrate existing data to Wyatt
   await pool.query("UPDATE tenants SET manager_id = $1 WHERE manager_id IS NULL", [wyattId]);
   await pool.query("UPDATE conversations SET manager_id = $1 WHERE manager_id IS NULL", [wyattId]);
   await pool.query("UPDATE requests SET manager_id = $1 WHERE manager_id IS NULL", [wyattId]);
 
-  console.log("[DB] Tables ready");
+  console.log("[DB] All tables ready (tenant flow + STR)");
 }
 
 // ─────────────────────────────────────────────
-// MANAGER FUNCTIONS
+// ICAL SYNC
+// ─────────────────────────────────────────────
+async function syncIcalForProperty(property) {
+  const urls = [property.ical_url, property.ical_url_2].filter(Boolean);
+  if (urls.length === 0) return;
+
+  for (const url of urls) {
+    try {
+      const events = await ical.async.fromURL(url);
+      for (const key of Object.keys(events)) {
+        const ev = events[key];
+        if (ev.type !== "VEVENT") continue;
+
+        const checkin = ev.start ? new Date(ev.start).toISOString().split("T")[0] : null;
+        const checkout = ev.end ? new Date(ev.end).toISOString().split("T")[0] : null;
+        if (!checkin || !checkout) continue;
+
+        const guestName = ev.summary || ev.description || null;
+        const uid = ev.uid || `${property.id}-${checkin}-${checkout}`;
+
+        await pool.query(`
+          INSERT INTO str_bookings (property_id, host_id, checkin_date, checkout_date, guest_name, ical_uid, status)
+          VALUES ($1, $2, $3, $4, $5, $6, 'upcoming')
+          ON CONFLICT (property_id, ical_uid) DO UPDATE SET
+            checkin_date = $3,
+            checkout_date = $4,
+            guest_name = $5,
+            status = CASE
+              WHEN NOW()::DATE > $4::DATE THEN 'completed'
+              WHEN NOW()::DATE >= $3::DATE THEN 'active'
+              ELSE 'upcoming'
+            END
+        `, [property.id, property.host_id, checkin, checkout, guestName, uid]);
+      }
+      console.log(`[ICAL SYNC] Property ${property.id} (${property.address}) synced from ${url}`);
+    } catch (err) {
+      console.error(`[ICAL SYNC ERROR] Property ${property.id}:`, err.message);
+    }
+  }
+}
+
+async function syncAllIcal() {
+  const res = await pool.query("SELECT * FROM str_properties WHERE ical_url IS NOT NULL OR ical_url_2 IS NOT NULL");
+  for (const property of res.rows) {
+    await syncIcalForProperty(property);
+  }
+}
+
+// Poll every hour
+setInterval(syncAllIcal, 60 * 60 * 1000);
+
+// ─────────────────────────────────────────────
+// CHECKOUT REMINDER CRON (check every 15 min)
+// ─────────────────────────────────────────────
+async function sendCheckoutReminders() {
+  const today = new Date().toISOString().split("T")[0];
+  const hour = new Date().getHours();
+  // Only send between 8am and 10am
+  if (hour < 8 || hour > 10) return;
+
+  const res = await pool.query(`
+    SELECT b.*, p.address, p.checkout_time, p.key_dropoff, h.twilio_number
+    FROM str_bookings b
+    JOIN str_properties p ON b.property_id = p.id
+    JOIN str_hosts h ON b.host_id = h.id
+    WHERE b.checkout_date = $1 AND b.status = 'active'
+  `, [today]);
+
+  for (const booking of res.rows) {
+    const guest = await pool.query(
+      "SELECT * FROM str_guests WHERE booking_id = $1",
+      [booking.id]
+    );
+    if (!guest.rows[0]?.phone) continue;
+
+    const msg =
+      `Good morning! Just a reminder that checkout today is at ${booking.checkout_time || "11:00 AM"}. ` +
+      `${booking.key_dropoff ? `Please leave the key at: ${booking.key_dropoff}. ` : ""}` +
+      `It was a pleasure having you — safe travels! Reply if you have any questions.`;
+
+    await sendSms(guest.rows[0].phone, msg, booking.twilio_number);
+
+    // Send review request 2 hours after checkout (schedule it)
+    setTimeout(async () => {
+      await sendSms(
+        guest.rows[0].phone,
+        `Hope you enjoyed your stay! If you have a moment, we'd love a review — it means the world to us. Thank you for choosing us!`,
+        booking.twilio_number
+      );
+    }, 2 * 60 * 60 * 1000);
+
+    // Mark booking completed
+    await pool.query("UPDATE str_bookings SET status = 'completed' WHERE id = $1", [booking.id]);
+    console.log(`[CHECKOUT REMINDER] Sent to ${guest.rows[0].phone} for ${booking.address}`);
+  }
+}
+
+setInterval(sendCheckoutReminders, 15 * 60 * 1000);
+
+// ─────────────────────────────────────────────
+// STR HOST FUNCTIONS
+// ─────────────────────────────────────────────
+async function getStrHostByTwilioNumber(number) {
+  const res = await pool.query("SELECT * FROM str_hosts WHERE twilio_number = $1", [number]);
+  return res.rows[0] || null;
+}
+
+async function getStrHostById(id) {
+  const res = await pool.query("SELECT * FROM str_hosts WHERE id = $1", [id]);
+  return res.rows[0] || null;
+}
+
+async function getStrPropertiesByHost(hostId) {
+  const res = await pool.query("SELECT * FROM str_properties WHERE host_id = $1 ORDER BY created_at DESC", [hostId]);
+  return res.rows;
+}
+
+// ─────────────────────────────────────────────
+// STR GUEST FUNCTIONS
+// ─────────────────────────────────────────────
+async function getStrGuest(phone, hostId) {
+  const res = await pool.query(
+    "SELECT * FROM str_guests WHERE phone = $1 AND host_id = $2",
+    [phone, hostId]
+  );
+  return res.rows[0] || null;
+}
+
+async function upsertStrGuest(phone, hostId, data) {
+  await pool.query(`
+    INSERT INTO str_guests (phone, host_id, property_id, booking_id, onboarding_state, pending_property_id, opted_out)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (phone, host_id) DO UPDATE SET
+      property_id = COALESCE($3, str_guests.property_id),
+      booking_id = COALESCE($4, str_guests.booking_id),
+      onboarding_state = COALESCE($5, str_guests.onboarding_state),
+      pending_property_id = $6,
+      opted_out = COALESCE($7, str_guests.opted_out)
+  `, [
+    phone, hostId,
+    data.property_id || null,
+    data.booking_id || null,
+    data.onboarding_state || 'awaiting_address',
+    data.pending_property_id || null,
+    data.opted_out ?? false
+  ]);
+}
+
+// ─────────────────────────────────────────────
+// ADDRESS FUZZY MATCH
+// ─────────────────────────────────────────────
+function normalizeAddress(addr) {
+  return addr.toLowerCase()
+    .replace(/\bstreet\b/g, "st").replace(/\bavenue\b/g, "ave")
+    .replace(/\bdrive\b/g, "dr").replace(/\bboulevard\b/g, "blvd")
+    .replace(/\blane\b/g, "ln").replace(/\broad\b/g, "rd")
+    .replace(/\bapartment\b/g, "apt").replace(/\bunit\b/g, "apt")
+    .replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function addressSimilarity(a, b) {
+  const na = normalizeAddress(a);
+  const nb = normalizeAddress(b);
+  if (na.includes(nb) || nb.includes(na)) return 1.0;
+  const wordsA = new Set(na.split(" "));
+  const wordsB = new Set(nb.split(" "));
+  const intersection = [...wordsA].filter(w => wordsB.has(w)).length;
+  const union = new Set([...wordsA, ...wordsB]).size;
+  return intersection / union;
+}
+
+async function findActiveBookingByAddress(hostId, guestAddress) {
+  const today = new Date().toISOString().split("T")[0];
+  const res = await pool.query(`
+    SELECT b.*, p.address, p.id as property_id
+    FROM str_bookings b
+    JOIN str_properties p ON b.property_id = p.id
+    WHERE b.host_id = $1
+      AND b.checkin_date <= $2
+      AND b.checkout_date >= $2
+      AND b.status IN ('upcoming', 'active')
+  `, [hostId, today]);
+
+  let bestMatch = null;
+  let bestScore = 0;
+  for (const booking of res.rows) {
+    const score = addressSimilarity(guestAddress, booking.address);
+    if (score > bestScore) { bestScore = score; bestMatch = booking; }
+  }
+  // Require at least 40% word overlap
+  return bestScore >= 0.4 ? bestMatch : null;
+}
+
+async function getPropertyById(propertyId) {
+  const res = await pool.query("SELECT * FROM str_properties WHERE id = $1", [propertyId]);
+  return res.rows[0] || null;
+}
+
+// ─────────────────────────────────────────────
+// STR CONVERSATION FUNCTIONS
+// ─────────────────────────────────────────────
+async function getStrConversation(phone, hostId) {
+  const res = await pool.query(
+    "SELECT * FROM str_conversations WHERE guest_phone = $1 AND host_id = $2",
+    [phone, hostId]
+  );
+  if (res.rows[0]) return res.rows[0];
+  await pool.query(`
+    INSERT INTO str_conversations (guest_phone, host_id, messages)
+    VALUES ($1, $2, '[]')
+    ON CONFLICT (guest_phone, host_id) DO NOTHING
+  `, [phone, hostId]);
+  return { guest_phone: phone, host_id: hostId, messages: [], escalated: false };
+}
+
+async function addStrMessage(phone, hostId, role, content) {
+  await pool.query(`
+    UPDATE str_conversations SET messages = messages || $1::jsonb, updated_at = NOW()
+    WHERE guest_phone = $2 AND host_id = $3
+  `, [JSON.stringify([{ role, content }]), phone, hostId]);
+}
+
+async function clearStrConversation(phone, hostId) {
+  await pool.query(
+    "UPDATE str_conversations SET messages = '[]', escalated = false WHERE guest_phone = $1 AND host_id = $2",
+    [phone, hostId]
+  );
+}
+
+// ─────────────────────────────────────────────
+// BUILD PROPERTY CONTEXT FOR CLAUDE
+// ─────────────────────────────────────────────
+function buildPropertyContext(property, booking) {
+  const lines = [
+    `Property address: ${property.address}`,
+    `Check-in time: ${property.checkin_time || "3:00 PM"}`,
+    `Check-out time: ${property.checkout_time || "11:00 AM"}`,
+  ];
+  if (property.door_code) lines.push(`Door code: ${property.door_code}`);
+  if (property.wifi_name) lines.push(`WiFi network: ${property.wifi_name}`);
+  if (property.wifi_password) lines.push(`WiFi password: ${property.wifi_password}`);
+  if (property.parking_instructions) lines.push(`Parking: ${property.parking_instructions}`);
+  if (property.key_dropoff) lines.push(`Key drop-off: ${property.key_dropoff}`);
+  if (property.thermostat_instructions) lines.push(`Thermostat: ${property.thermostat_instructions}`);
+  if (property.washer_dryer_instructions) lines.push(`Washer/dryer: ${property.washer_dryer_instructions}`);
+  if (property.tv_instructions) lines.push(`TV/streaming: ${property.tv_instructions}`);
+  if (property.trash_instructions) lines.push(`Trash: ${property.trash_instructions}`);
+  if (property.house_rules) lines.push(`House rules: ${property.house_rules}`);
+  if (property.breaker_location) lines.push(`Breaker box location: ${property.breaker_location}`);
+  if (property.water_shutoff) lines.push(`Water shutoff: ${property.water_shutoff}`);
+  if (property.nearest_urgent_care) lines.push(`Nearest urgent care: ${property.nearest_urgent_care}`);
+  if (property.local_restaurants) lines.push(`Local restaurants: ${property.local_restaurants}`);
+  if (property.local_grocery) lines.push(`Grocery store: ${property.local_grocery}`);
+  if (property.local_coffee) lines.push(`Coffee shop: ${property.local_coffee}`);
+  if (property.local_activities) lines.push(`Things to do nearby: ${property.local_activities}`);
+  if (property.extra_notes) lines.push(`Additional notes: ${property.extra_notes}`);
+  if (booking) {
+    lines.push(`Guest check-out date: ${booking.checkout_date}`);
+    if (booking.guest_name) lines.push(`Guest name from booking: ${booking.guest_name}`);
+  }
+  return lines.join("\n");
+}
+
+function isQuietHours(property) {
+  const hour = new Date().getHours();
+  const start = property.quiet_hours_start ?? 22;
+  const end = property.quiet_hours_end ?? 8;
+  if (start > end) return hour >= start || hour < end;
+  return hour >= start && hour < end;
+}
+
+function isEmergency(text) {
+  const lower = text.toLowerCase();
+  const keywords = ["gas leak", "gas smell", "fire", "flooding", "flood", "electrical fire",
+    "smoke", "carbon monoxide", "no heat", "locked out", "break in", "intruder"];
+  return keywords.some(k => lower.includes(k));
+}
+
+// ─────────────────────────────────────────────
+// ESCALATE TO HOST
+// ─────────────────────────────────────────────
+async function escalateToHost(host, guestPhone, property, issue, isEmerg) {
+  const msg =
+    `GUEST ALERT${isEmerg ? " - EMERGENCY" : ""}\n` +
+    `Property: ${property.address}\n` +
+    `Guest Phone: ${guestPhone}\n` +
+    `Issue: ${issue}\n\n` +
+    `Reply to this number to respond — your reply will be forwarded to the guest automatically.`;
+
+  await sendSms(host.host_phone, msg, host.twilio_number);
+  await pool.query(
+    "UPDATE str_conversations SET escalated = true WHERE guest_phone = $1 AND host_id = $2",
+    [guestPhone, host.id]
+  );
+  console.log(`[STR ESCALATE] ${isEmerg ? "EMERGENCY " : ""}Host ${host.name} alerted for ${guestPhone} at ${property.address}`);
+
+  // If no reply in 30 min, notify guest
+  if (!isEmerg) {
+    setTimeout(async () => {
+      const convo = await getStrConversation(guestPhone, host.id);
+      if (convo.escalated) {
+        await sendSms(guestPhone,
+          "We've passed your request to the host and are waiting to hear back. We'll update you as soon as we get a response.",
+          host.twilio_number
+        );
+      }
+    }, 30 * 60 * 1000);
+  }
+}
+
+// ─────────────────────────────────────────────
+// CLAUDE STR — AI RESOLUTION
+// ─────────────────────────────────────────────
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+function buildStrSystemPrompt(property, booking) {
+  const context = buildPropertyContext(property, booking);
+  return `You are an AI host assistant for a short-term rental property. You help guests with questions and issues during their stay via SMS. Keep all replies SHORT — this is SMS.
+
+PROPERTY KNOWLEDGE BASE:
+${context}
+
+YOUR RESOLUTION APPROACH:
+1. FIRST check if the answer is in the property knowledge base above. If yes, answer directly and concisely.
+2. If not in the knowledge base, try to troubleshoot using general knowledge (appliance fixes, common issues).
+3. If you cannot resolve it after trying, say you are escalating to the host and end your reply with exactly: ESCALATE|<one sentence summary of the issue>
+4. For EMERGENCIES (gas, fire, flooding, carbon monoxide), respond with safety instructions AND end your reply with: EMERGENCY|<one sentence summary>
+
+TONE: Warm, helpful, like a knowledgeable friend. Never robotic.
+LANGUAGE: Auto-detect and reply in the guest's language.
+LENGTH: 1-3 sentences max per SMS reply.
+
+IMPORTANT: Never make up information not in the knowledge base. If unsure, escalate.`;
+}
+
+async function processStrMessage(host, guestPhone, message, property, booking) {
+  try {
+    await addStrMessage(guestPhone, host.id, "user", message);
+    const convo = await getStrConversation(guestPhone, host.id);
+
+    // Use web search tool for things not in knowledge base
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 500,
+        system: buildStrSystemPrompt(property, booking),
+        messages: convo.messages,
+        tools: [{
+          type: "web_search_20250305",
+          name: "web_search"
+        }]
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error("[CLAUDE STR ERROR]", data);
+      await sendSms(guestPhone, "Sorry, I ran into an issue. Let me get the host for you.", host.twilio_number);
+      await escalateToHost(host, guestPhone, property, "System error — guest needs help", false);
+      return;
+    }
+
+    // Extract text from response (may include tool use blocks)
+    const rawReply = data.content
+      .filter(b => b.type === "text")
+      .map(b => b.text)
+      .join("") || "";
+
+    await addStrMessage(guestPhone, host.id, "assistant", rawReply);
+
+    // Check for escalation signal
+    const emergMatch = rawReply.match(/EMERGENCY\|(.+)/);
+    const escalateMatch = rawReply.match(/ESCALATE\|(.+)/);
+
+    const cleanReply = rawReply
+      .replace(/\nEMERGENCY\|[^\n]*/g, "")
+      .replace(/\nESCALATE\|[^\n]*/g, "")
+      .trim();
+
+    await sendSms(guestPhone, cleanReply || "Let me get the host for you right away.", host.twilio_number);
+
+    if (emergMatch) {
+      await escalateToHost(host, guestPhone, property, emergMatch[1].trim(), true);
+    } else if (escalateMatch) {
+      // Respect quiet hours for non-emergency escalations
+      if (isQuietHours(property)) {
+        await sendSms(guestPhone,
+          `The host has been notified and will follow up first thing in the morning. If this is an emergency, please call ${host.host_phone} directly.`,
+          host.twilio_number
+        );
+        // Queue for morning
+        const msUntilMorning = getMillisUntilHour(property.quiet_hours_end ?? 8);
+        setTimeout(() => escalateToHost(host, guestPhone, property, escalateMatch[1].trim(), false), msUntilMorning);
+      } else {
+        await escalateToHost(host, guestPhone, property, escalateMatch[1].trim(), false);
+      }
+    }
+  } catch (err) {
+    console.error("[CLAUDE STR EXCEPTION]", err);
+    await sendSms(guestPhone, "Sorry, something went wrong. I'll get the host to reach out to you directly.", host.twilio_number);
+  }
+}
+
+function getMillisUntilHour(targetHour) {
+  const now = new Date();
+  const target = new Date();
+  target.setHours(targetHour, 0, 0, 0);
+  if (target <= now) target.setDate(target.getDate() + 1);
+  return target - now;
+}
+
+// ─────────────────────────────────────────────
+// STR SMS FLOW
+// ─────────────────────────────────────────────
+async function handleStrSms(host, from, body) {
+  const lower = body.toLowerCase().trim();
+
+  // Opt-out
+  if (["stop", "stopall", "unsubscribe", "cancel", "end", "quit"].includes(lower)) {
+    await pool.query("UPDATE str_guests SET opted_out = true WHERE phone = $1 AND host_id = $2", [from, host.id]);
+    return;
+  }
+
+  // Check if host is replying to escalation (host_phone texting in)
+  if (from === host.host_phone) {
+    await handleHostReplyStr(host, body);
+    return;
+  }
+
+  let guest = await getStrGuest(from, host.id);
+
+  // ── NEW GUEST ──────────────────────────────
+  if (!guest) {
+    await upsertStrGuest(from, host.id, { onboarding_state: "awaiting_address" });
+    await sendSms(from,
+      `Hi! I'm your AI host assistant. To get started, what's the address of the property you're staying at?`,
+      host.twilio_number
+    );
+    return;
+  }
+
+  if (guest.opted_out) return;
+
+  // ── RETURNING GUEST — check if they have an active booking ───────────
+  if (guest.onboarding_state === "linked" && guest.booking_id) {
+    const booking = await pool.query("SELECT * FROM str_bookings WHERE id = $1", [guest.booking_id]);
+    const bk = booking.rows[0];
+    const today = new Date().toISOString().split("T")[0];
+
+    // Booking over — check if they have a new active booking
+    if (bk && bk.checkout_date < today) {
+      const newBooking = await findActiveBookingByAddress(host.id,
+        (await getPropertyById(guest.property_id))?.address || ""
+      );
+      if (newBooking) {
+        await upsertStrGuest(from, host.id, {
+          booking_id: newBooking.id,
+          property_id: newBooking.property_id,
+          onboarding_state: "linked"
+        });
+        await clearStrConversation(from, host.id);
+        guest = await getStrGuest(from, host.id);
+      } else {
+        await sendSms(from,
+          `Hi! Your previous stay has ended. If you have a new booking, please text the address you're staying at and I'll get you set up.`,
+          host.twilio_number
+        );
+        await upsertStrGuest(from, host.id, { onboarding_state: "awaiting_address", property_id: null, booking_id: null });
+        return;
+      }
+    }
+
+    // Active linked guest — process with Claude
+    if (guest.onboarding_state === "linked") {
+      const property = await getPropertyById(guest.property_id);
+      const booking2 = await pool.query("SELECT * FROM str_bookings WHERE id = $1", [guest.booking_id]);
+      if (isEmergency(body)) {
+        await sendSms(from,
+          `This sounds like an emergency. If you're in immediate danger, call 911 first. I'm alerting your host right now.`,
+          host.twilio_number
+        );
+        await escalateToHost(host, from, property, body, true);
+        return;
+      }
+      processStrMessage(host, from, body, property, booking2.rows[0]);
+      return;
+    }
+  }
+
+  // ── AWAITING ADDRESS ─────────────────────────
+  if (guest.onboarding_state === "awaiting_address") {
+    const match = await findActiveBookingByAddress(host.id, body);
+    if (!match) {
+      await sendSms(from,
+        `I couldn't find an active booking at that address. Double-check the address or contact your host directly. What address are you staying at?`,
+        host.twilio_number
+      );
+      return;
+    }
+    // Found a match — ask guest to confirm
+    await upsertStrGuest(from, host.id, {
+      onboarding_state: "awaiting_confirmation",
+      pending_property_id: match.property_id
+    });
+    // Store the matched booking ID temporarily
+    await pool.query(
+      "UPDATE str_guests SET booking_id = $1 WHERE phone = $2 AND host_id = $3",
+      [match.id, from, host.id]
+    );
+    const property = await getPropertyById(match.property_id);
+    await sendSms(from,
+      `Just to confirm — are you staying at ${property.address}? Reply YES or NO.`,
+      host.twilio_number
+    );
+
+    // Timeout: reset if no reply in 10 minutes
+    setTimeout(async () => {
+      const g = await getStrGuest(from, host.id);
+      if (g?.onboarding_state === "awaiting_confirmation") {
+        await upsertStrGuest(from, host.id, {
+          onboarding_state: "awaiting_address",
+          pending_property_id: null,
+          booking_id: null
+        });
+        await sendSms(from,
+          `We didn't hear back from you. No worries — just text the address whenever you're ready!`,
+          host.twilio_number
+        );
+        console.log(`[STR TIMEOUT] ${from} confirmation timed out`);
+      }
+    }, 10 * 60 * 1000);
+    return;
+  }
+
+  // ── AWAITING CONFIRMATION ────────────────────
+  if (guest.onboarding_state === "awaiting_confirmation") {
+    const answer = lower.replace(/[^a-z]/g, "");
+    if (["yes", "yeah", "yep", "yup", "correct", "right", "y"].includes(answer)) {
+      await upsertStrGuest(from, host.id, {
+        onboarding_state: "linked",
+        property_id: guest.pending_property_id,
+        pending_property_id: null
+      });
+      const property = await getPropertyById(guest.pending_property_id);
+      const booking = await pool.query("SELECT * FROM str_bookings WHERE id = $1", [guest.booking_id]);
+      await sendSms(from,
+        `Perfect, you're all set! I'm your AI host assistant for ${property.address}. Ask me anything — WiFi, check-out info, local spots, or if something needs fixing. I'm here 24/7!`,
+        host.twilio_number
+      );
+      console.log(`[STR LINKED] ${from} linked to property ${guest.pending_property_id}`);
+    } else if (["no", "nope", "n", "wrong", "incorrect"].includes(answer)) {
+      await upsertStrGuest(from, host.id, {
+        onboarding_state: "awaiting_address",
+        pending_property_id: null,
+        booking_id: null
+      });
+      await sendSms(from,
+        `No problem! What's the address of the property you're staying at?`,
+        host.twilio_number
+      );
+    } else {
+      // Unclear answer — re-ask
+      await sendSms(from,
+        `Sorry, I didn't catch that. Reply YES if that's correct, or NO to try a different address.`,
+        host.twilio_number
+      );
+    }
+    return;
+  }
+
+  // Fallback
+  await sendSms(from,
+    `Hi! What's the address of the property you're staying at?`,
+    host.twilio_number
+  );
+}
+
+// ─────────────────────────────────────────────
+// HOST REPLY HANDLER (STR)
+// ─────────────────────────────────────────────
+async function handleHostReplyStr(host, body) {
+  // Find most recently escalated guest for this host
+  const res = await pool.query(`
+    SELECT c.guest_phone, c.property_id
+    FROM str_conversations c
+    WHERE c.host_id = $1 AND c.escalated = true
+    ORDER BY c.updated_at DESC LIMIT 1
+  `, [host.id]);
+
+  if (!res.rows[0]) {
+    await sendSms(host.host_phone, "No open escalations found.", host.twilio_number);
+    return;
+  }
+
+  const { guest_phone, property_id } = res.rows[0];
+  await sendSms(guest_phone, body, host.twilio_number);
+  await pool.query(
+    "UPDATE str_conversations SET escalated = false WHERE guest_phone = $1 AND host_id = $2",
+    [guest_phone, host.id]
+  );
+  await sendSms(host.host_phone, `Your reply was forwarded to the guest at ${guest_phone}.`, host.twilio_number);
+  console.log(`[STR HOST REPLY] Host ${host.name} replied to ${guest_phone}`);
+}
+
+// ─────────────────────────────────────────────
+// MANAGER FUNCTIONS (existing)
 // ─────────────────────────────────────────────
 async function getManagerByTwilioNumber(number) {
   const res = await pool.query("SELECT * FROM managers WHERE twilio_number = $1", [number]);
@@ -138,7 +842,6 @@ async function createManager(name, email, twilioNumber, password, plan, contacts
     VALUES ($1, $2, $3, $4, $5) RETURNING id
   `, [name, email, twilioNumber, password, plan]);
   const managerId = res.rows[0].id;
-
   const categories = ["plumbing", "electrical", "hvac", "structural", "pest", "security", "appliances", "general"];
   for (const cat of categories) {
     const phone = contacts[cat] || contacts.default || "+13308106687";
@@ -163,7 +866,7 @@ async function getManagerStats(managerId) {
 }
 
 // ─────────────────────────────────────────────
-// MAINTENANCE CONTACT FUNCTIONS
+// MAINTENANCE CONTACT FUNCTIONS (existing)
 // ─────────────────────────────────────────────
 const ISSUE_KEYWORDS = {
   plumbing:   ["leak", "leaking", "pipe", "drain", "toilet", "sink", "faucet", "water heater", "clog", "clogged", "flood", "flooding", "sewage", "water"],
@@ -186,7 +889,6 @@ async function getMaintenanceContact(managerId, summary) {
     [managerId, category]
   );
   if (res.rows[0]) return { category, ...res.rows[0] };
-  // Fallback to general
   const fallback = await pool.query(
     "SELECT * FROM maintenance_contacts WHERE manager_id = $1 AND category = 'general'",
     [managerId]
@@ -200,7 +902,7 @@ async function getAllMaintenancePhones(managerId) {
 }
 
 // ─────────────────────────────────────────────
-// TENANT FUNCTIONS
+// TENANT FUNCTIONS (existing)
 // ─────────────────────────────────────────────
 async function getTenant(phone, managerId) {
   const res = await pool.query("SELECT * FROM tenants WHERE phone = $1 AND manager_id = $2", [phone, managerId]);
@@ -221,7 +923,6 @@ async function upsertTenant(phone, managerId, data) {
 
 async function saveAddress(phone, managerId, address) {
   await pool.query("UPDATE tenants SET address = $1 WHERE phone = $2 AND manager_id = $3", [address, phone, managerId]);
-  console.log(`[PROFILE SAVED] ${phone} → ${address}`);
 }
 
 async function isOptedOut(phone, managerId) {
@@ -236,12 +937,10 @@ async function isFirstTimeTexter(phone, managerId) {
 
 async function recordOptIn(phone, managerId) {
   await upsertTenant(phone, managerId, { opted_in: true, opted_out: false });
-  console.log(`[OPT-IN] ${phone}`);
 }
 
 async function recordOptOut(phone, managerId) {
   await pool.query("UPDATE tenants SET opted_out = true WHERE phone = $1 AND manager_id = $2", [phone, managerId]);
-  console.log(`[OPT-OUT] ${phone}`);
 }
 
 async function getTenantByAddress(managerId, addressFragment) {
@@ -253,7 +952,7 @@ async function getTenantByAddress(managerId, addressFragment) {
 }
 
 // ─────────────────────────────────────────────
-// CONVERSATION FUNCTIONS
+// CONVERSATION FUNCTIONS (existing)
 // ─────────────────────────────────────────────
 async function getConversation(phone, managerId) {
   const res = await pool.query("SELECT * FROM conversations WHERE phone = $1 AND manager_id = $2", [phone, managerId]);
@@ -277,7 +976,6 @@ async function markResolved(phone, managerId) {
   await pool.query("UPDATE conversations SET resolved = true, updated_at = NOW() WHERE phone = $1 AND manager_id = $2", [phone, managerId]);
   setTimeout(async () => {
     await pool.query("UPDATE conversations SET messages = '[]', resolved = false WHERE phone = $1 AND manager_id = $2", [phone, managerId]);
-    console.log(`[CONVO RESET] ${phone}`);
   }, 24 * 60 * 60 * 1000);
 }
 
@@ -291,7 +989,7 @@ async function clearConversation(phone, managerId) {
 }
 
 // ─────────────────────────────────────────────
-// REQUEST FUNCTIONS
+// REQUEST FUNCTIONS (existing)
 // ─────────────────────────────────────────────
 async function saveRequest(managerId, tenantPhone, address, summary, urgency, availability, category) {
   const res = await pool.query(`
@@ -318,7 +1016,7 @@ async function markRequestDone(id) {
 }
 
 // ─────────────────────────────────────────────
-// COMPLIANCE MESSAGES
+// COMPLIANCE MESSAGES (existing)
 // ─────────────────────────────────────────────
 const OPT_IN_CONFIRMATION =
   "Welcome to Tenant Flow AI! By texting this number you consent to receive " +
@@ -335,7 +1033,7 @@ const STOP_KEYWORDS  = new Set(["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END
 const START_KEYWORDS = new Set(["START", "UNSTOP", "YES"]);
 
 // ─────────────────────────────────────────────
-// TWILIO REST CLIENT
+// TWILIO
 // ─────────────────────────────────────────────
 const TWILIO_ACCOUNT_SID  = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN   = process.env.TWILIO_AUTH_TOKEN;
@@ -357,7 +1055,7 @@ async function sendSms(to, message, fromNumber) {
 }
 
 // ─────────────────────────────────────────────
-// EMAIL
+// EMAIL (existing)
 // ─────────────────────────────────────────────
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
@@ -374,7 +1072,7 @@ transporter.verify(err => {
 
 async function sendEmail(to, subject, body) {
   try {
-    const info = await transporter.sendMail({ from: `"Tenant Flow AI" <${GMAIL_USER}>`, to, subject, text: body });
+    await transporter.sendMail({ from: `"Tenant Flow AI" <${GMAIL_USER}>`, to, subject, text: body });
     console.log(`[EMAIL SENT] to ${to}`);
   } catch (err) {
     console.error("[EMAIL ERROR]", err.message);
@@ -382,7 +1080,7 @@ async function sendEmail(to, subject, body) {
 }
 
 // ─────────────────────────────────────────────
-// NOTIFY MAINTENANCE
+// NOTIFY MAINTENANCE (existing)
 // ─────────────────────────────────────────────
 async function notifyMaintenance(manager, tenantPhone, summary, urgency, availability, address) {
   const contact = await getMaintenanceContact(manager.id, summary);
@@ -397,7 +1095,6 @@ async function notifyMaintenance(manager, tenantPhone, summary, urgency, availab
     `New Maintenance Job\n\nCategory: ${contact.category.toUpperCase()}\nProperty: ${address}\n` +
     `Tenant Phone: ${tenantPhone}\nUrgency: ${urgency}\nAvailability: ${availability}\n\nIssue:\n${summary}\n\n---\nTenant Flow AI`;
 
-  console.log(`[MAINTENANCE ALERT] Manager: ${manager.name} | ${contact.category} → ${contact.phone}`);
   await Promise.all([
     sendSms(contact.phone, smsMessage, manager.twilio_number),
     sendEmail(manager.email || GMAIL_USER, `[${urgency}] ${contact.category.toUpperCase()} - ${address}`, emailBody),
@@ -405,7 +1102,7 @@ async function notifyMaintenance(manager, tenantPhone, summary, urgency, availab
 }
 
 // ─────────────────────────────────────────────
-// MAINTENANCE REPLY HANDLER
+// MAINTENANCE REPLY HANDLER (existing)
 // ─────────────────────────────────────────────
 const STATUS_KEYWORDS = {
   done:        ["done", "completed", "complete", "finished", "fixed", "resolved"],
@@ -459,10 +1156,8 @@ async function handleMaintenanceReply(manager, from, body) {
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE AI
+// CLAUDE AI (existing tenant flow)
 // ─────────────────────────────────────────────
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-
 const SYSTEM_PROMPT = `You are Tenant Flow AI, a friendly AI property management assistant that helps tenants submit maintenance requests via SMS.
 
 Your goal is to collect all the information needed to dispatch the right maintenance person in as few messages as possible. Keep messages short since this is SMS.
@@ -505,7 +1200,6 @@ async function processWithClaude(manager, tenantPhone, message) {
   try {
     await addMessage(tenantPhone, manager.id, "user", message);
     const convo = await getConversation(tenantPhone, manager.id);
-    console.log(`[CLAUDE] Manager: ${manager.name} | Tenant: ${tenantPhone} (${convo.messages.length} msgs)`);
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
@@ -524,7 +1218,6 @@ async function processWithClaude(manager, tenantPhone, message) {
     await sendSms(tenantPhone, reply, manager.twilio_number);
     if (resolution) {
       if (resolution.address && resolution.address !== "Unknown") await saveAddress(tenantPhone, manager.id, resolution.address);
-      console.log(`[RESOLVED] ${tenantPhone} | ${resolution.urgency} | ${resolution.summary}`);
       await markResolved(tenantPhone, manager.id);
       await notifyMaintenance(manager, tenantPhone, resolution.summary, resolution.urgency, resolution.availability, resolution.address);
     }
@@ -559,9 +1252,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─────────────────────────────────────────────
-// LOGGING
-// ─────────────────────────────────────────────
 app.use((req, res, next) => {
   console.log("[" + new Date().toISOString() + "] " + req.method + " " + req.path);
   next();
@@ -587,8 +1277,355 @@ async function checkManagerAuth(req, res, next) {
   next();
 }
 
+async function checkStrHostAuth(req, res, next) {
+  const hostId = req.cookies?.str_host_id;
+  const hostPass = req.cookies?.str_host_pass;
+  if (!hostId) return res.redirect("/str/login");
+  const host = await getStrHostById(parseInt(hostId));
+  if (!host || host.dashboard_password !== hostPass) return res.redirect("/str/login");
+  req.strHost = host;
+  next();
+}
+
 // ─────────────────────────────────────────────
-// ADMIN LOGIN
+// STR HOST LOGIN
+// ─────────────────────────────────────────────
+app.get("/str/login", (req, res) => {
+  const error = req.query.error ? '<p style="color:#ef4444;margin-bottom:16px;font-size:14px;">Incorrect credentials.</p>' : "";
+  res.send(`<html><head><title>Host Login — STR</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{background:white;border-radius:16px;padding:40px;width:100%;max-width:380px;box-shadow:0 4px 24px rgba(0,0,0,0.08);}h1{font-size:22px;color:#1e293b;margin-bottom:8px;}p{font-size:14px;color:#64748b;margin-bottom:28px;}label{font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px;}input{width:100%;padding:12px 14px;border:1px solid #e2e8f0;border-radius:8px;font-size:15px;outline:none;margin-bottom:16px;}button{width:100%;padding:13px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer;}</style></head><body><div class="card"><h1>Host Dashboard</h1><p>STR Guest Experience — Host Login</p>${error}<form method="POST" action="/str/login"><label>Phone Number (your Twilio number)</label><input name="twilio_number" placeholder="+15551234567"><label>Password</label><input type="password" name="password" autofocus><button>Sign In</button></form></div></body></html>`);
+});
+
+app.post("/str/login", async (req, res) => {
+  const { twilio_number, password } = req.body;
+  const host = await getStrHostByTwilioNumber(twilio_number);
+  if (host && host.dashboard_password === password) {
+    res.setHeader("Set-Cookie", [
+      `str_host_id=${host.id}; Path=/; HttpOnly; Max-Age=86400`,
+      `str_host_pass=${password}; Path=/; HttpOnly; Max-Age=86400`
+    ]);
+    res.redirect("/str/dashboard");
+  } else {
+    res.redirect("/str/login?error=1");
+  }
+});
+
+app.get("/str/logout", (req, res) => {
+  res.setHeader("Set-Cookie", ["str_host_id=; Path=/; HttpOnly; Max-Age=0", "str_host_pass=; Path=/; HttpOnly; Max-Age=0"]);
+  res.redirect("/str/login");
+});
+
+// ─────────────────────────────────────────────
+// STR HOST DASHBOARD
+// ─────────────────────────────────────────────
+app.get("/str/dashboard", checkStrHostAuth, async (req, res) => {
+  const host = req.strHost;
+  const properties = await getStrPropertiesByHost(host.id);
+
+  const today = new Date().toISOString().split("T")[0];
+  const activeBookings = await pool.query(`
+    SELECT b.*, p.address, p.name as property_name
+    FROM str_bookings b
+    JOIN str_properties p ON b.property_id = p.id
+    WHERE b.host_id = $1 AND b.checkin_date <= $2 AND b.checkout_date >= $2
+    ORDER BY b.checkout_date ASC
+  `, [host.id, today]);
+
+  const escalations = await pool.query(`
+    SELECT c.*, p.address
+    FROM str_conversations c
+    LEFT JOIN str_properties p ON c.property_id = p.id
+    WHERE c.host_id = $1 AND c.escalated = true
+    ORDER BY c.updated_at DESC
+  `, [host.id]);
+
+  const activeRows = activeBookings.rows.map(b => `
+    <tr>
+      <td>${b.property_name || b.address}</td>
+      <td>${b.checkin_date}</td>
+      <td>${b.checkout_date}</td>
+      <td>${b.guest_name || "—"}</td>
+      <td><span style="background:#22c55e;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${b.status}</span></td>
+    </tr>
+  `).join("");
+
+  const escalationRows = escalations.rows.map(e => `
+    <tr>
+      <td>${e.address || "Unknown"}</td>
+      <td>${e.guest_phone}</td>
+      <td>${timeAgo(e.updated_at)}</td>
+      <td><span style="background:#ef4444;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">Open</span></td>
+    </tr>
+  `).join("");
+
+  const propRows = properties.map(p => `
+    <tr>
+      <td>${p.name || p.address}</td>
+      <td style="font-size:12px;color:#64748b">${p.address}</td>
+      <td>${p.ical_url ? '<span style="color:#22c55e;font-weight:bold">Yes</span>' : '<span style="color:#94a3b8">No</span>'}</td>
+      <td style="display:flex;gap:6px">
+        <a href="/str/properties/${p.id}/edit" style="background:#3b82f6;color:white;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:bold;text-decoration:none">Edit</a>
+        <form method="POST" action="/str/properties/${p.id}/sync" style="display:inline">
+          <button type="submit" style="background:#8b5cf6;color:white;border:none;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:bold;cursor:pointer">Sync iCal</button>
+        </form>
+      </td>
+    </tr>
+  `).join("");
+
+  res.send(`
+    <html><head><title>STR Dashboard — ${host.name}</title><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;color:#1e293b;}
+    .header{background:#1e293b;color:white;padding:20px 32px;display:flex;align-items:center;justify-content:space-between;}
+    .header h1{font-size:20px;}.logout{font-size:13px;color:#94a3b8;text-decoration:none;padding:6px 12px;border:1px solid #475569;border-radius:6px;}
+    .content{padding:32px;}.section{background:white;border-radius:12px;padding:24px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+    h2{font-size:17px;margin-bottom:16px;font-weight:700;}
+    table{width:100%;border-collapse:collapse;}
+    th{text-align:left;padding:10px 14px;font-size:12px;color:#64748b;text-transform:uppercase;border-bottom:1px solid #e2e8f0;}
+    td{padding:12px 14px;font-size:14px;border-bottom:1px solid #f1f5f9;}tr:last-child td{border-bottom:none;}
+    .stat-row{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap;}
+    .stat{background:white;border-radius:12px;padding:20px 24px;flex:1;min-width:120px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+    .stat .num{font-size:28px;font-weight:bold;}.stat .label{font-size:12px;color:#64748b;margin-top:4px;}
+    .btn{display:inline-block;padding:10px 20px;background:#1e293b;color:white;border-radius:8px;font-size:13px;font-weight:bold;text-decoration:none;border:none;cursor:pointer;}
+    </style><meta http-equiv="refresh" content="60"></head><body>
+    <div class="header">
+      <h1>STR Dashboard — ${host.name}</h1>
+      <a href="/str/logout" class="logout">Sign Out</a>
+    </div>
+    <div class="content">
+      <div class="stat-row">
+        <div class="stat"><div class="num">${properties.length}</div><div class="label">Properties</div></div>
+        <div class="stat"><div class="num" style="color:#22c55e">${activeBookings.rows.length}</div><div class="label">Active Stays</div></div>
+        <div class="stat"><div class="num" style="color:#ef4444">${escalations.rows.length}</div><div class="label">Open Escalations</div></div>
+      </div>
+
+      ${escalations.rows.length > 0 ? `
+      <div class="section">
+        <h2 style="color:#ef4444">Open Escalations</h2>
+        <table>
+          <thead><tr><th>Property</th><th>Guest Phone</th><th>Since</th><th>Status</th></tr></thead>
+          <tbody>${escalationRows}</tbody>
+        </table>
+        <p style="font-size:13px;color:#64748b;margin-top:12px">Reply from your host phone (${host.host_phone}) to respond — your reply is auto-forwarded to the guest.</p>
+      </div>` : ""}
+
+      <div class="section">
+        <h2>Active Stays Today</h2>
+        <table>
+          <thead><tr><th>Property</th><th>Check-in</th><th>Check-out</th><th>Guest</th><th>Status</th></tr></thead>
+          <tbody>${activeRows || '<tr><td colspan="5" style="text-align:center;padding:32px;color:#94a3b8">No active stays today</td></tr>'}</tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <h2 style="margin:0">Properties</h2>
+          <a href="/str/properties/new" class="btn">Add Property</a>
+        </div>
+        <table>
+          <thead><tr><th>Name</th><th>Address</th><th>iCal Synced</th><th>Actions</th></tr></thead>
+          <tbody>${propRows || '<tr><td colspan="4" style="text-align:center;padding:32px;color:#94a3b8">No properties yet — add one above</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div></body></html>
+  `);
+});
+
+// ─────────────────────────────────────────────
+// STR PROPERTY MANAGEMENT
+// ─────────────────────────────────────────────
+function propertyForm(property = {}, action = "/str/properties", method = "POST") {
+  const v = (field) => property[field] || "";
+  return `
+    <html><head><title>${property.id ? "Edit" : "Add"} Property</title><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;padding:32px;color:#1e293b;}
+    .card{background:white;border-radius:16px;padding:32px;max-width:800px;margin:0 auto;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+    h1{font-size:22px;margin-bottom:24px;}
+    .section-title{font-size:14px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin:24px 0 12px;padding-top:16px;border-top:1px solid #e2e8f0;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+    .full{grid-column:1/-1;}
+    label{font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px;}
+    input,textarea,select{width:100%;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none;font-family:inherit;}
+    textarea{min-height:80px;resize:vertical;}
+    .btn-row{display:flex;gap:12px;margin-top:24px;}
+    button{padding:12px 24px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;}
+    a.back{font-size:14px;color:#64748b;text-decoration:none;padding:12px 0;display:inline-block;}
+    </style></head><body>
+    <div class="card">
+      <h1>${property.id ? "Edit Property" : "Add New Property"}</h1>
+      <form method="${method}" action="${action}">
+
+        <p class="section-title">Basic info</p>
+        <div class="grid">
+          <div><label>Property name (optional)</label><input name="name" value="${v("name")}" placeholder="Beach House, Unit 4B..."></div>
+          <div class="full"><label>Full address *</label><input name="address" value="${v("address")}" placeholder="123 Main St, Lima OH 45801" required></div>
+        </div>
+
+        <p class="section-title">iCal sync (paste from Airbnb / VRBO settings)</p>
+        <div class="grid">
+          <div class="full"><label>iCal URL 1</label><input name="ical_url" value="${v("ical_url")}" placeholder="https://www.airbnb.com/calendar/ical/..."></div>
+          <div class="full"><label>iCal URL 2 (optional — for second platform)</label><input name="ical_url_2" value="${v("ical_url_2")}" placeholder="https://www.vrbo.com/icalendar/..."></div>
+        </div>
+
+        <p class="section-title">Access</p>
+        <div class="grid">
+          <div><label>Check-in time</label><input name="checkin_time" value="${v("checkin_time") || "3:00 PM"}" placeholder="3:00 PM"></div>
+          <div><label>Check-out time</label><input name="checkout_time" value="${v("checkout_time") || "11:00 AM"}" placeholder="11:00 AM"></div>
+          <div><label>Door / lockbox code</label><input name="door_code" value="${v("door_code")}" placeholder="1234"></div>
+          <div><label>Key drop-off location</label><input name="key_dropoff" value="${v("key_dropoff")}" placeholder="Lockbox on front gate"></div>
+          <div class="full"><label>Parking instructions</label><textarea name="parking_instructions">${v("parking_instructions")}</textarea></div>
+        </div>
+
+        <p class="section-title">WiFi</p>
+        <div class="grid">
+          <div><label>Network name</label><input name="wifi_name" value="${v("wifi_name")}" placeholder="HomeNetwork_5G"></div>
+          <div><label>Password</label><input name="wifi_password" value="${v("wifi_password")}" placeholder="password123"></div>
+        </div>
+
+        <p class="section-title">Appliances & utilities</p>
+        <div class="grid">
+          <div class="full"><label>Thermostat instructions</label><textarea name="thermostat_instructions">${v("thermostat_instructions")}</textarea></div>
+          <div class="full"><label>Washer / dryer instructions</label><textarea name="washer_dryer_instructions">${v("washer_dryer_instructions")}</textarea></div>
+          <div class="full"><label>TV / streaming instructions</label><textarea name="tv_instructions">${v("tv_instructions")}</textarea></div>
+          <div class="full"><label>Trash & recycling</label><textarea name="trash_instructions">${v("trash_instructions")}</textarea></div>
+        </div>
+
+        <p class="section-title">House rules</p>
+        <div class="grid">
+          <div class="full"><label>House rules</label><textarea name="house_rules">${v("house_rules")}</textarea></div>
+          <div><label>Quiet hours start (24hr)</label><input name="quiet_hours_start" type="number" value="${v("quiet_hours_start") || 22}" min="0" max="23"></div>
+          <div><label>Quiet hours end (24hr)</label><input name="quiet_hours_end" type="number" value="${v("quiet_hours_end") || 8}" min="0" max="23"></div>
+        </div>
+
+        <p class="section-title">Emergency info</p>
+        <div class="grid">
+          <div><label>Breaker box location</label><input name="breaker_location" value="${v("breaker_location")}" placeholder="Hallway closet, left side"></div>
+          <div><label>Water shutoff location</label><input name="water_shutoff" value="${v("water_shutoff")}" placeholder="Under kitchen sink"></div>
+          <div class="full"><label>Nearest urgent care</label><input name="nearest_urgent_care" value="${v("nearest_urgent_care")}" placeholder="St. Rita's Medical Center — 0.5 miles"></div>
+        </div>
+
+        <p class="section-title">Local recommendations</p>
+        <div class="grid">
+          <div class="full"><label>Restaurants</label><textarea name="local_restaurants">${v("local_restaurants")}</textarea></div>
+          <div><label>Grocery store</label><input name="local_grocery" value="${v("local_grocery")}" placeholder="Kroger — 0.3 miles on Main St"></div>
+          <div><label>Coffee shop</label><input name="local_coffee" value="${v("local_coffee")}" placeholder="Starbucks — 2 min walk"></div>
+          <div class="full"><label>Things to do nearby</label><textarea name="local_activities">${v("local_activities")}</textarea></div>
+        </div>
+
+        <p class="section-title">Additional notes</p>
+        <div><label>Extra notes for guests</label><textarea name="extra_notes">${v("extra_notes")}</textarea></div>
+
+        <div class="btn-row">
+          <button type="submit">${property.id ? "Save Changes" : "Add Property"}</button>
+          <a href="/str/dashboard" class="back">Cancel</a>
+        </div>
+      </form>
+    </div></body></html>
+  `;
+}
+
+app.get("/str/properties/new", checkStrHostAuth, (req, res) => {
+  res.send(propertyForm({}, "/str/properties"));
+});
+
+app.post("/str/properties", checkStrHostAuth, async (req, res) => {
+  const host = req.strHost;
+  const b = req.body;
+  await pool.query(`
+    INSERT INTO str_properties (
+      host_id, name, address, ical_url, ical_url_2,
+      wifi_name, wifi_password, door_code, checkin_time, checkout_time,
+      parking_instructions, key_dropoff, thermostat_instructions,
+      washer_dryer_instructions, tv_instructions, trash_instructions,
+      house_rules, quiet_hours_start, quiet_hours_end,
+      breaker_location, water_shutoff, nearest_urgent_care,
+      local_restaurants, local_grocery, local_coffee, local_activities, extra_notes
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+  `, [
+    host.id, b.name||null, b.address, b.ical_url||null, b.ical_url_2||null,
+    b.wifi_name||null, b.wifi_password||null, b.door_code||null,
+    b.checkin_time||"3:00 PM", b.checkout_time||"11:00 AM",
+    b.parking_instructions||null, b.key_dropoff||null,
+    b.thermostat_instructions||null, b.washer_dryer_instructions||null,
+    b.tv_instructions||null, b.trash_instructions||null,
+    b.house_rules||null,
+    parseInt(b.quiet_hours_start)||22, parseInt(b.quiet_hours_end)||8,
+    b.breaker_location||null, b.water_shutoff||null, b.nearest_urgent_care||null,
+    b.local_restaurants||null, b.local_grocery||null, b.local_coffee||null,
+    b.local_activities||null, b.extra_notes||null
+  ]);
+  console.log(`[STR] Property added for host ${host.name}: ${b.address}`);
+  res.redirect("/str/dashboard");
+});
+
+app.get("/str/properties/:id/edit", checkStrHostAuth, async (req, res) => {
+  const property = await getPropertyById(parseInt(req.params.id));
+  if (!property || property.host_id !== req.strHost.id) return res.redirect("/str/dashboard");
+  res.send(propertyForm(property, `/str/properties/${property.id}`, "POST"));
+});
+
+app.post("/str/properties/:id", checkStrHostAuth, async (req, res) => {
+  const host = req.strHost;
+  const b = req.body;
+  const id = parseInt(req.params.id);
+  await pool.query(`
+    UPDATE str_properties SET
+      name=$1, address=$2, ical_url=$3, ical_url_2=$4,
+      wifi_name=$5, wifi_password=$6, door_code=$7,
+      checkin_time=$8, checkout_time=$9, parking_instructions=$10,
+      key_dropoff=$11, thermostat_instructions=$12, washer_dryer_instructions=$13,
+      tv_instructions=$14, trash_instructions=$15, house_rules=$16,
+      quiet_hours_start=$17, quiet_hours_end=$18, breaker_location=$19,
+      water_shutoff=$20, nearest_urgent_care=$21, local_restaurants=$22,
+      local_grocery=$23, local_coffee=$24, local_activities=$25, extra_notes=$26
+    WHERE id=$27 AND host_id=$28
+  `, [
+    b.name||null, b.address, b.ical_url||null, b.ical_url_2||null,
+    b.wifi_name||null, b.wifi_password||null, b.door_code||null,
+    b.checkin_time||"3:00 PM", b.checkout_time||"11:00 AM",
+    b.parking_instructions||null, b.key_dropoff||null,
+    b.thermostat_instructions||null, b.washer_dryer_instructions||null,
+    b.tv_instructions||null, b.trash_instructions||null, b.house_rules||null,
+    parseInt(b.quiet_hours_start)||22, parseInt(b.quiet_hours_end)||8,
+    b.breaker_location||null, b.water_shutoff||null, b.nearest_urgent_care||null,
+    b.local_restaurants||null, b.local_grocery||null, b.local_coffee||null,
+    b.local_activities||null, b.extra_notes||null,
+    id, host.id
+  ]);
+  res.redirect("/str/dashboard");
+});
+
+app.post("/str/properties/:id/sync", checkStrHostAuth, async (req, res) => {
+  const property = await getPropertyById(parseInt(req.params.id));
+  if (property && property.host_id === req.strHost.id) {
+    await syncIcalForProperty(property);
+  }
+  res.redirect("/str/dashboard");
+});
+
+// ─────────────────────────────────────────────
+// ADMIN — ADD STR HOST
+// ─────────────────────────────────────────────
+app.post("/admin/str-hosts", checkAdminAuth, async (req, res) => {
+  const { name, email, twilio_number, password, host_phone, plan } = req.body;
+  await pool.query(`
+    INSERT INTO str_hosts (name, email, twilio_number, dashboard_password, host_phone, plan)
+    VALUES ($1, $2, $3, $4, $5, $6)
+  `, [name, email, twilio_number, password, host_phone, plan || "starter"]);
+  console.log(`[ADMIN] STR host added: ${name} | ${twilio_number}`);
+  res.redirect("/admin");
+});
+
+app.post("/admin/str-hosts/:id/delete", checkAdminAuth, async (req, res) => {
+  const id = req.params.id;
+  await pool.query("DELETE FROM str_conversations WHERE host_id = $1", [id]);
+  await pool.query("DELETE FROM str_guests WHERE host_id = $1", [id]);
+  await pool.query("DELETE FROM str_bookings WHERE host_id = $1", [id]);
+  await pool.query("DELETE FROM str_properties WHERE host_id = $1", [id]);
+  await pool.query("DELETE FROM str_hosts WHERE id = $1", [id]);
+  res.redirect("/admin");
+});
+
+// ─────────────────────────────────────────────
+// ADMIN LOGIN (existing)
 // ─────────────────────────────────────────────
 app.get("/admin/login", (req, res) => {
   const error = req.query.error ? '<p style="color:#ef4444;margin-bottom:16px;font-size:14px;">Incorrect password.</p>' : "";
@@ -605,66 +1642,58 @@ app.post("/admin/login", (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ADMIN PANEL
+// ADMIN PANEL (existing + STR section added)
 // ─────────────────────────────────────────────
 app.get("/admin", checkAdminAuth, async (req, res) => {
   const managers = await getAllManagers();
   const statsPromises = managers.map(m => getManagerStats(m.id));
   const stats = await Promise.all(statsPromises);
+  const strHosts = await pool.query("SELECT * FROM str_hosts ORDER BY created_at DESC");
 
   const PLAN_PRICES = { starter: 149, growth: 299, pro: 599 };
-
-  const mrr = managers.reduce((sum, m) => sum + (PLAN_PRICES[m.plan] || 0), 0);
+  const mrr = managers.reduce((sum, m) => sum + (PLAN_PRICES[m.plan] || 0), 0)
+            + strHosts.rows.reduce((sum, h) => sum + (PLAN_PRICES[h.plan] || 0), 0);
   const arr = mrr * 12;
 
   function monthsActive(createdAt) {
-    const months = Math.floor((new Date() - new Date(createdAt)) / (1000 * 60 * 60 * 24 * 30));
-    return Math.max(1, months);
+    return Math.max(1, Math.floor((new Date() - new Date(createdAt)) / (1000 * 60 * 60 * 24 * 30)));
   }
 
   const clientRows = managers.map((m, i) => `
     <tr>
-      <td>${m.name}</td>
-      <td>${m.email || "-"}</td>
-      <td>${m.twilio_number}</td>
+      <td>${m.name}</td><td>${m.email || "-"}</td><td>${m.twilio_number}</td>
       <td><code style="background:#f1f5f9;padding:2px 8px;border-radius:4px;font-size:13px">${m.dashboard_password}</code></td>
-      <td>
-        <form method="POST" action="/admin/managers/${m.id}/plan" style="display:flex;align-items:center;gap:6px">
-          <select name="plan" style="padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px">
-            <option value="starter" ${m.plan === "starter" ? "selected" : ""}>Starter $149</option>
-            <option value="growth" ${m.plan === "growth" ? "selected" : ""}>Growth $299</option>
-            <option value="pro" ${m.plan === "pro" ? "selected" : ""}>Pro $599</option>
-          </select>
-          <button type="submit" style="background:#3b82f6;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Save</button>
-        </form>
-      </td>
-      <td>${stats[i].total}</td>
-      <td>${stats[i].active}</td>
-      <td>${timeAgo(m.created_at)}</td>
+      <td><form method="POST" action="/admin/managers/${m.id}/plan" style="display:flex;align-items:center;gap:6px">
+        <select name="plan" style="padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px">
+          <option value="starter" ${m.plan==="starter"?"selected":""}>Starter $149</option>
+          <option value="growth" ${m.plan==="growth"?"selected":""}>Growth $299</option>
+          <option value="pro" ${m.plan==="pro"?"selected":""}>Pro $599</option>
+        </select>
+        <button type="submit" style="background:#3b82f6;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Save</button>
+      </form></td>
+      <td>${stats[i].total}</td><td>${stats[i].active}</td><td>${timeAgo(m.created_at)}</td>
       <td style="display:flex;gap:6px">
-        <a href="/admin/managers/${m.id}/contacts" style="background:#8b5cf6;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold;text-decoration:none">Edit Contacts</a>
-        <form method="POST" action="/admin/managers/${m.id}/delete" onsubmit="return confirm('Delete ${m.name}? This cannot be undone.')">
+        <a href="/admin/managers/${m.id}/contacts" style="background:#8b5cf6;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold;text-decoration:none">Contacts</a>
+        <form method="POST" action="/admin/managers/${m.id}/delete" onsubmit="return confirm('Delete ${m.name}?')">
           <button type="submit" style="background:#ef4444;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Delete</button>
         </form>
       </td>
     </tr>
   `).join("");
 
-  const revenueRows = managers.map(m => {
-    const monthly = PLAN_PRICES[m.plan] || 0;
-    const months = monthsActive(m.created_at);
-    const total = monthly * months;
-    return `
-      <tr>
-        <td>${m.name}</td>
-        <td><span style="background:#3b82f6;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${m.plan}</span></td>
-        <td style="color:#22c55e;font-weight:bold">$${monthly}/mo</td>
-        <td>${new Date(m.created_at).toLocaleDateString("en-US", { month: "short", year: "numeric" })}</td>
-        <td>${months} month${months !== 1 ? "s" : ""}</td>
-        <td style="font-weight:bold">$${total.toLocaleString()}</td>
-      </tr>
-    `;
-  }).join("");
+  const strHostRows = strHosts.rows.map(h => `
+    <tr>
+      <td>${h.name}</td><td>${h.email||"-"}</td><td>${h.twilio_number}</td>
+      <td>${h.host_phone}</td>
+      <td><code style="background:#f1f5f9;padding:2px 8px;border-radius:4px;font-size:13px">${h.dashboard_password}</code></td>
+      <td>${timeAgo(h.created_at)}</td>
+      <td>
+        <form method="POST" action="/admin/str-hosts/${h.id}/delete" onsubmit="return confirm('Delete ${h.name}?')">
+          <button type="submit" style="background:#ef4444;color:white;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Delete</button>
+        </form>
+      </td>
+    </tr>
+  `).join("");
 
   res.send(`
     <html><head><title>Tenant Flow AI Admin</title><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -686,6 +1715,8 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
     .mrr-banner .big{font-size:48px;font-weight:bold;color:#22c55e;}
     .mrr-banner .sub{font-size:14px;color:#94a3b8;margin-top:4px;}
     .mrr-banner .arr{font-size:22px;font-weight:bold;color:#94a3b8;}
+    .tab{display:inline-block;padding:8px 20px;border-radius:20px;font-size:13px;font-weight:bold;background:#f1f5f9;color:#64748b;text-decoration:none;margin-right:8px;}
+    .tab.active{background:#1e293b;color:white;}
     </style></head><body>
     <div class="header"><h1>Tenant Flow AI — Admin</h1><a href="/admin/logout" class="logout">Sign Out</a></div>
     <div class="content">
@@ -694,7 +1725,7 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
         <div>
           <div style="font-size:13px;color:#94a3b8;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.05em">Monthly Recurring Revenue</div>
           <div class="big">$${mrr.toLocaleString()}</div>
-          <div class="sub">${managers.length} active client${managers.length !== 1 ? "s" : ""}</div>
+          <div class="sub">${managers.length + strHosts.rows.length} active clients</div>
         </div>
         <div style="text-align:right">
           <div style="font-size:13px;color:#94a3b8;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.05em">Annual Run Rate</div>
@@ -702,26 +1733,16 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
         </div>
       </div>
 
-      <div class="stat-row">
-        <div class="stat"><div class="num">${managers.length}</div><div class="label">Total Clients</div></div>
-        <div class="stat"><div class="num" style="color:#22c55e">$${mrr.toLocaleString()}</div><div class="label">MRR</div></div>
-        <div class="stat"><div class="num" style="color:#f97316">${stats.reduce((a,s)=>a+parseInt(s.active),0)}</div><div class="label">Active Requests</div></div>
-        <div class="stat"><div class="num" style="color:#3b82f6">${stats.reduce((a,s)=>a+parseInt(s.total),0)}</div><div class="label">Total Requests</div></div>
-      </div>
-
       <div class="section">
-        <h2>Revenue Tracker</h2>
+        <h2>Property Management Clients</h2>
         <table>
-          <thead><tr><th>Client</th><th>Plan</th><th>Monthly Revenue</th><th>Started</th><th>Months Active</th><th>Total Paid</th></tr></thead>
-          <tbody>${revenueRows || '<tr><td colspan="6" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
+          <thead><tr><th>Name</th><th>Email</th><th>Twilio #</th><th>Password</th><th>Plan</th><th>Total</th><th>Active</th><th>Added</th><th>Actions</th></tr></thead>
+          <tbody>${clientRows || '<tr><td colspan="9" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
         </table>
-        <div style="padding:16px;text-align:right;font-size:15px;font-weight:bold;color:#1e293b;border-top:2px solid #e2e8f0;margin-top:8px">
-          Total MRR: <span style="color:#22c55e;font-size:20px">$${mrr.toLocaleString()}/mo</span>
-        </div>
       </div>
 
       <div class="section">
-        <h2>Add New Client</h2>
+        <h2>Add Property Management Client</h2>
         <form method="POST" action="/admin/managers">
           <div class="form-grid">
             <div><label>Manager Name</label><input name="name" placeholder="John Smith" required></div>
@@ -730,31 +1751,46 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
             <div><label>Dashboard Password</label><input name="password" placeholder="their login password" required></div>
             <div><label>Plan</label><select name="plan"><option value="starter">Starter — $149/mo</option><option value="growth">Growth — $299/mo</option><option value="pro">Pro — $599/mo</option></select></div>
           </div>
-          <div style="margin-top:20px">
-            <p style="font-size:13px;font-weight:bold;color:#374151;margin-bottom:12px">Maintenance Contacts (leave blank to use default for all)</p>
+          <div style="margin-top:16px">
+            <p style="font-size:13px;font-weight:bold;color:#374151;margin-bottom:12px">Maintenance Contacts</p>
             <div class="form-grid">
-              <div><label>🔧 Plumbing</label><input name="plumbing" placeholder="+15551234567"></div>
-              <div><label>⚡ Electrical</label><input name="electrical" placeholder="+15551234567"></div>
-              <div><label>❄️ HVAC</label><input name="hvac" placeholder="+15551234567"></div>
-              <div><label>🪟 Structural</label><input name="structural" placeholder="+15551234567"></div>
-              <div><label>🐛 Pest Control</label><input name="pest" placeholder="+15551234567"></div>
-              <div><label>🔒 Security</label><input name="security" placeholder="+15551234567"></div>
-              <div><label>🏠 Appliances</label><input name="appliances" placeholder="+15551234567"></div>
-              <div><label>🧹 General</label><input name="general" placeholder="+15551234567"></div>
+              <div><label>Plumbing</label><input name="plumbing" placeholder="+15551234567"></div>
+              <div><label>Electrical</label><input name="electrical" placeholder="+15551234567"></div>
+              <div><label>HVAC</label><input name="hvac" placeholder="+15551234567"></div>
+              <div><label>Structural</label><input name="structural" placeholder="+15551234567"></div>
+              <div><label>Pest Control</label><input name="pest" placeholder="+15551234567"></div>
+              <div><label>Security</label><input name="security" placeholder="+15551234567"></div>
+              <div><label>Appliances</label><input name="appliances" placeholder="+15551234567"></div>
+              <div><label>General</label><input name="general" placeholder="+15551234567"></div>
             </div>
-            <p style="font-size:12px;color:#94a3b8;margin-top:8px">Tip: You can set one number for all categories or different numbers per trade.</p>
           </div>
           <button type="submit" style="margin-top:16px">Add Client</button>
         </form>
       </div>
 
       <div class="section">
-        <h2>All Clients</h2>
+        <h2>STR Hosts</h2>
         <table>
-          <thead><tr><th>Name</th><th>Email</th><th>Twilio Number</th><th>Dashboard Password</th><th>Plan</th><th>Total Requests</th><th>Active</th><th>Added</th><th>Actions</th></tr></thead>
-          <tbody>${clientRows || '<tr><td colspan="9" style="text-align:center;padding:40px;color:#94a3b8">No clients yet</td></tr>'}</tbody>
+          <thead><tr><th>Name</th><th>Email</th><th>Twilio #</th><th>Host Phone</th><th>Password</th><th>Added</th><th>Actions</th></tr></thead>
+          <tbody>${strHostRows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#94a3b8">No STR hosts yet</td></tr>'}</tbody>
         </table>
       </div>
+
+      <div class="section">
+        <h2>Add STR Host</h2>
+        <form method="POST" action="/admin/str-hosts">
+          <div class="form-grid">
+            <div><label>Host Name</label><input name="name" placeholder="Jane Smith" required></div>
+            <div><label>Email</label><input name="email" type="email" placeholder="jane@email.com"></div>
+            <div><label>Twilio Number (dedicated for this host)</label><input name="twilio_number" placeholder="+15551234567" required></div>
+            <div><label>Host's Personal Cell (for escalations)</label><input name="host_phone" placeholder="+15551234567" required></div>
+            <div><label>Dashboard Password</label><input name="password" placeholder="their login password" required></div>
+            <div><label>Plan</label><select name="plan"><option value="starter">Starter — $149/mo</option><option value="growth">Growth — $299/mo</option><option value="pro">Pro — $599/mo</option></select></div>
+          </div>
+          <button type="submit" style="margin-top:16px">Add STR Host</button>
+        </form>
+      </div>
+
     </div></body></html>
   `);
 });
@@ -762,154 +1798,53 @@ app.get("/admin", checkAdminAuth, async (req, res) => {
 app.post("/admin/managers", checkAdminAuth, async (req, res) => {
   const { name, email, twilio_number, password, plan, plumbing, electrical, hvac, structural, pest, security, appliances, general } = req.body;
   const contacts = { plumbing, electrical, hvac, structural, pest, security, appliances, general };
-  await createManager(name, email, twilio_number, password, plan, contacts);
-  console.log(`[ADMIN] New manager created: ${name} | ${twilio_number}`);
-
-  const PLAN_PRICES = { starter: 149, growth: 299, pro: 599 };
-  const planLabel = plan.charAt(0).toUpperCase() + plan.slice(1);
-  const price = PLAN_PRICES[plan] || 0;
-
-  res.send(`
-    <html><head><title>Client Added</title><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
-    .card{background:white;border-radius:16px;padding:40px;width:100%;max-width:560px;box-shadow:0 4px 24px rgba(0,0,0,0.08);}
-    .check{width:56px;height:56px;background:#22c55e;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:20px;}
-    .check svg{width:28px;height:28px;}
-    h1{font-size:24px;color:#1e293b;margin-bottom:8px;}
-    p.sub{font-size:15px;color:#64748b;margin-bottom:28px;}
-    .info-box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin-bottom:24px;}
-    .info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #e2e8f0;}
-    .info-row:last-child{border-bottom:none;}
-    .info-label{font-size:13px;color:#64748b;font-weight:bold;}
-    .info-value{font-size:14px;color:#1e293b;font-weight:bold;}
-    .info-value code{background:#e2e8f0;padding:3px 8px;border-radius:4px;font-size:13px;}
-    .copy-box{background:#1e293b;color:#e2e8f0;border-radius:12px;padding:20px;margin-bottom:24px;font-size:13px;line-height:1.8;white-space:pre-wrap;}
-    .copy-box strong{color:white;}
-    .btn{display:inline-block;padding:12px 24px;background:#1e293b;color:white;text-decoration:none;border-radius:8px;font-size:14px;font-weight:bold;margin-right:8px;}
-    .btn.green{background:#22c55e;}
-    button.copy-btn{padding:10px 20px;background:#3b82f6;color:white;border:none;border-radius:8px;font-size:13px;font-weight:bold;cursor:pointer;margin-bottom:20px;width:100%;}
-    </style></head><body>
-    <div class="card">
-      <div class="check"><svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
-      <h1>Client Added Successfully!</h1>
-      <p class="sub">Here are the login credentials for ${name}. Copy and send them now.</p>
-
-      <div class="info-box">
-        <div class="info-row"><span class="info-label">Name</span><span class="info-value">${name}</span></div>
-        <div class="info-row"><span class="info-label">Dashboard URL</span><span class="info-value"><code>tenant-flow-ai.com/dashboard/login</code></span></div>
-        <div class="info-row"><span class="info-label">Login Phone</span><span class="info-value"><code>${twilio_number}</code></span></div>
-        <div class="info-row"><span class="info-label">Password</span><span class="info-value"><code>${password}</code></span></div>
-        <div class="info-row"><span class="info-label">Plan</span><span class="info-value">${planLabel} — $${price}/mo</span></div>
-        <div class="info-row"><span class="info-label">Tenant SMS Number</span><span class="info-value"><code>${twilio_number}</code></span></div>
-      </div>
-
-      <p style="font-size:13px;color:#64748b;margin-bottom:12px;font-weight:bold">Copy this message to send to your client:</p>
-      <div class="copy-box" id="msg"><strong>Welcome to Tenant Flow AI, ${name}!</strong>
-
-Your account is ready. Here is how to get started:
-
-Dashboard Login: tenant-flow-ai.com/dashboard/login
-Phone Number: ${twilio_number}
-Password: ${password}
-
-Your tenants can start texting ${twilio_number} to report maintenance issues right away.
-
-Plan: ${planLabel} ($${price}/month)
-
-Questions? Reply to this message or email wyattmorgan@tenant-flow-ai.com</div>
-
-      <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('msg').innerText).then(()=>{this.textContent='Copied!';this.style.background='#22c55e';})">Copy Message to Clipboard</button>
-
-      <a href="/admin" class="btn">Back to Admin</a>
-    </div>
-    </body></html>
-  `);
+  const managerId = await createManager(name, email, twilio_number, password, plan, contacts);
+  console.log(`[ADMIN] New manager created: ${name}`);
+  res.redirect("/admin");
 });
 
 app.post("/admin/managers/:id/plan", checkAdminAuth, async (req, res) => {
-  const { plan } = req.body;
-  await pool.query("UPDATE managers SET plan = $1 WHERE id = $2", [plan, req.params.id]);
-  console.log(`[ADMIN] Plan updated for manager ${req.params.id} → ${plan}`);
+  await pool.query("UPDATE managers SET plan = $1 WHERE id = $2", [req.body.plan, req.params.id]);
   res.redirect("/admin");
 });
 
 app.post("/admin/managers/:id/delete", checkAdminAuth, async (req, res) => {
   const id = req.params.id;
-  // Delete in correct order to avoid foreign key violations
   await pool.query("DELETE FROM maintenance_contacts WHERE manager_id = $1", [id]);
   await pool.query("DELETE FROM requests WHERE manager_id = $1", [id]);
   await pool.query("DELETE FROM conversations WHERE manager_id = $1", [id]);
   await pool.query("DELETE FROM tenants WHERE manager_id = $1", [id]);
   await pool.query("DELETE FROM managers WHERE id = $1", [id]);
-  console.log(`[ADMIN] Manager ${id} deleted`);
   res.redirect("/admin");
 });
 
 app.get("/admin/managers/:id/contacts", checkAdminAuth, async (req, res) => {
   const manager = await getManagerById(parseInt(req.params.id));
   if (!manager) return res.redirect("/admin");
-
-  const contacts = await pool.query(
-    "SELECT * FROM maintenance_contacts WHERE manager_id = $1 ORDER BY category",
-    [manager.id]
-  );
+  const contacts = await pool.query("SELECT * FROM maintenance_contacts WHERE manager_id = $1 ORDER BY category", [manager.id]);
   const contactMap = {};
   contacts.rows.forEach(c => { contactMap[c.category] = c; });
-
   const categories = [
-    { key: "plumbing", label: "🔧 Plumbing" },
-    { key: "electrical", label: "⚡ Electrical" },
-    { key: "hvac", label: "❄️ HVAC" },
-    { key: "structural", label: "🪟 Structural" },
-    { key: "pest", label: "🐛 Pest Control" },
-    { key: "security", label: "🔒 Security" },
-    { key: "appliances", label: "🏠 Appliances" },
-    { key: "general", label: "🧹 General" },
+    { key: "plumbing", label: "Plumbing" }, { key: "electrical", label: "Electrical" },
+    { key: "hvac", label: "HVAC" }, { key: "structural", label: "Structural" },
+    { key: "pest", label: "Pest Control" }, { key: "security", label: "Security" },
+    { key: "appliances", label: "Appliances" }, { key: "general", label: "General" },
   ];
-
   const fields = categories.map(c => `
-    <div>
-      <label style="font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px">${c.label}</label>
-      <input name="${c.key}" value="${contactMap[c.key]?.phone || ""}" placeholder="+15551234567"
-        style="width:100%;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none">
-    </div>
+    <div><label style="font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px">${c.label}</label>
+    <input name="${c.key}" value="${contactMap[c.key]?.phone || ""}" placeholder="+15551234567" style="width:100%;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;outline:none"></div>
   `).join("");
-
-  res.send(`
-    <html><head><title>Edit Contacts — ${manager.name}</title><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;padding:40px 32px;color:#1e293b;}
-    .card{background:white;border-radius:16px;padding:32px;max-width:700px;margin:0 auto;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
-    h1{font-size:22px;margin-bottom:6px;}p{font-size:14px;color:#64748b;margin-bottom:28px;}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px;}
-    button{padding:12px 24px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin-right:8px;}
-    a.back{font-size:14px;color:#64748b;text-decoration:none;}
-    </style></head><body>
-    <div class="card">
-      <h1>Edit Maintenance Contacts</h1>
-      <p>Client: ${manager.name} | Number: ${manager.twilio_number}</p>
-      <form method="POST" action="/admin/managers/${manager.id}/contacts">
-        <div class="grid">${fields}</div>
-        <button type="submit">Save Contacts</button>
-        <a href="/admin" class="back">Cancel</a>
-      </form>
-    </div>
-    </body></html>
-  `);
+  res.send(`<html><head><title>Edit Contacts</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;padding:40px 32px;color:#1e293b;}.card{background:white;border-radius:16px;padding:32px;max-width:700px;margin:0 auto;box-shadow:0 1px 3px rgba(0,0,0,0.08);}h1{font-size:22px;margin-bottom:6px;}p{font-size:14px;color:#64748b;margin-bottom:28px;}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px;}button{padding:12px 24px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;margin-right:8px;}a.back{font-size:14px;color:#64748b;text-decoration:none;}</style></head><body><div class="card"><h1>Edit Maintenance Contacts</h1><p>${manager.name} | ${manager.twilio_number}</p><form method="POST" action="/admin/managers/${manager.id}/contacts"><div class="grid">${fields}</div><button type="submit">Save</button><a href="/admin" class="back">Cancel</a></form></div></body></html>`);
 });
 
 app.post("/admin/managers/:id/contacts", checkAdminAuth, async (req, res) => {
   const managerId = parseInt(req.params.id);
   const categories = ["plumbing", "electrical", "hvac", "structural", "pest", "security", "appliances", "general"];
   for (const cat of categories) {
-    const phone = req.body[cat];
-    if (phone) {
-      await pool.query(
-        "UPDATE maintenance_contacts SET phone = $1 WHERE manager_id = $2 AND category = $3",
-        [phone, managerId, cat]
-      );
+    if (req.body[cat]) {
+      await pool.query("UPDATE maintenance_contacts SET phone = $1 WHERE manager_id = $2 AND category = $3", [req.body[cat], managerId, cat]);
     }
   }
-  console.log(`[ADMIN] Maintenance contacts updated for manager ${managerId}`);
   res.redirect("/admin");
 });
 
@@ -919,112 +1854,60 @@ app.get("/admin/logout", (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// MANAGER DASHBOARD LOGIN
+// MANAGER DASHBOARD (existing — unchanged)
 // ─────────────────────────────────────────────
 app.get("/dashboard/login", (req, res) => {
   const error = req.query.error ? '<p style="color:#ef4444;margin-bottom:16px;font-size:14px;">Incorrect password.</p>' : "";
-  res.send(`<html><head><title>Dashboard Login</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{background:white;border-radius:16px;padding:40px;width:100%;max-width:380px;box-shadow:0 4px 24px rgba(0,0,0,0.08);}h1{font-size:22px;color:#1e293b;margin-bottom:8px;}p.sub{font-size:14px;color:#64748b;margin-bottom:28px;}label{font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px;}input{width:100%;padding:12px 14px;border:1px solid #e2e8f0;border-radius:8px;font-size:15px;outline:none;margin-bottom:16px;}button{width:100%;padding:13px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer;}</style></head><body><div class="card"><h1>Tenant Flow AI</h1><p class="sub">Sign in to your dashboard</p>${error}<form method="POST" action="/dashboard/login"><label>Phone Number (your Twilio number)</label><input name="twilio_number" placeholder="+15139518826"><label>Password</label><input type="password" name="password" autofocus><button>Sign In</button></form></div></body></html>`);
+  res.send(`<html><head><title>Dashboard Login</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{background:white;border-radius:16px;padding:40px;width:100%;max-width:380px;box-shadow:0 4px 24px rgba(0,0,0,0.08);}h1{font-size:22px;color:#1e293b;margin-bottom:8px;}p.sub{font-size:14px;color:#64748b;margin-bottom:28px;}label{font-size:13px;font-weight:bold;color:#374151;display:block;margin-bottom:6px;}input{width:100%;padding:12px 14px;border:1px solid #e2e8f0;border-radius:8px;font-size:15px;outline:none;margin-bottom:16px;}button{width:100%;padding:13px;background:#1e293b;color:white;border:none;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer;}</style></head><body><div class="card"><h1>Tenant Flow AI</h1><p class="sub">Sign in to your dashboard</p>${error}<form method="POST" action="/dashboard/login"><label>Phone Number</label><input name="twilio_number" placeholder="+15139518826"><label>Password</label><input type="password" name="password" autofocus><button>Sign In</button></form></div></body></html>`);
 });
 
 app.post("/dashboard/login", async (req, res) => {
   const { twilio_number, password } = req.body;
   const manager = await getManagerByTwilioNumber(twilio_number);
   if (manager && manager.dashboard_password === password) {
-    res.setHeader("Set-Cookie", [
-      `manager_id=${manager.id}; Path=/; HttpOnly; Max-Age=86400`,
-      `manager_pass=${password}; Path=/; HttpOnly; Max-Age=86400`
-    ]);
+    res.setHeader("Set-Cookie", [`manager_id=${manager.id}; Path=/; HttpOnly; Max-Age=86400`, `manager_pass=${password}; Path=/; HttpOnly; Max-Age=86400`]);
     res.redirect("/dashboard");
   } else {
     res.redirect("/dashboard/login?error=1");
   }
 });
 
-// ─────────────────────────────────────────────
-// MANAGER DASHBOARD
-// ─────────────────────────────────────────────
 app.get("/dashboard", checkManagerAuth, async (req, res) => {
   const manager = req.manager;
   const filter = req.query.filter || "all";
   let requests = await getRequestsByManager(manager.id);
-
-  const total     = requests.length;
-  const active    = requests.filter(r => r.status === "active").length;
+  const total = requests.length;
+  const active = requests.filter(r => r.status === "active").length;
   const completed = requests.filter(r => r.status === "completed").length;
   const emergency = requests.filter(r => r.urgency === "EMERGENCY").length;
-
   if (filter === "active") requests = requests.filter(r => r.status === "active");
   if (filter === "completed") requests = requests.filter(r => r.status === "completed");
   if (filter === "scheduled") requests = requests.filter(r => r.status === "scheduled");
-
   const rows = requests.map(r => `
     <tr>
-      <td>${timeAgo(r.created_at)}</td>
-      <td>${r.address || "Unknown"}</td>
-      <td>${r.tenant_phone}</td>
+      <td>${timeAgo(r.created_at)}</td><td>${r.address||"Unknown"}</td><td>${r.tenant_phone}</td>
       <td><span style="background:${urgencyColor(r.urgency)};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold">${r.urgency}</span></td>
-      <td>${r.category}</td>
-      <td>${r.summary}</td>
-      <td>${r.availability}</td>
-      <td>
-        <form method="POST" action="/dashboard/status/${r.id}" style="display:flex;align-items:center;gap:6px">
-          <select name="status" style="padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px">
-            <option value="active" ${r.status === "active" ? "selected" : ""}>Active</option>
-            <option value="scheduled" ${r.status === "scheduled" ? "selected" : ""}>Scheduled</option>
-            <option value="completed" ${r.status === "completed" ? "selected" : ""}>Completed</option>
-            <option value="unavailable" ${r.status === "unavailable" ? "selected" : ""}>Unavailable</option>
-          </select>
-          <button type="submit" style="background:#1e293b;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Save</button>
-        </form>
-      </td>
+      <td>${r.category}</td><td>${r.summary}</td><td>${r.availability}</td>
+      <td><form method="POST" action="/dashboard/status/${r.id}" style="display:flex;align-items:center;gap:6px">
+        <select name="status" style="padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px">
+          <option value="active" ${r.status==="active"?"selected":""}>Active</option>
+          <option value="scheduled" ${r.status==="scheduled"?"selected":""}>Scheduled</option>
+          <option value="completed" ${r.status==="completed"?"selected":""}>Completed</option>
+          <option value="unavailable" ${r.status==="unavailable"?"selected":""}>Unavailable</option>
+        </select>
+        <button type="submit" style="background:#1e293b;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">Save</button>
+      </form></td>
     </tr>
   `).join("");
-
-  res.send(`
-    <html><head><title>${manager.name} — Dashboard</title><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;color:#1e293b;}
-    .header{background:#1e293b;color:white;padding:20px 32px;display:flex;align-items:center;justify-content:space-between;}
-    .header h1{font-size:20px;}.header-right{display:flex;align-items:center;gap:16px;}
-    .header-right span{font-size:13px;color:#94a3b8;}.logout{font-size:13px;color:#94a3b8;text-decoration:none;padding:6px 12px;border:1px solid #475569;border-radius:6px;}
-    .stats{display:flex;gap:16px;padding:24px 32px;flex-wrap:wrap;}
-    .stat{background:white;border-radius:12px;padding:20px 24px;flex:1;min-width:140px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
-    .stat .num{font-size:32px;font-weight:bold;}.stat .label{font-size:13px;color:#64748b;margin-top:4px;}
-    .filters{padding:0 32px 16px;display:flex;gap:8px;flex-wrap:wrap;}
-    .filters a{padding:8px 16px;border-radius:20px;text-decoration:none;font-size:13px;font-weight:bold;background:white;color:#64748b;}
-    .filters a.active{background:#1e293b;color:white;}
-    .table-wrap{padding:0 32px 32px;overflow-x:auto;}
-    table{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
-    th{background:#f8fafc;text-align:left;padding:12px 16px;font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;}
-    td{padding:14px 16px;font-size:14px;border-bottom:1px solid #f1f5f9;vertical-align:middle;}
-    tr:last-child td{border-bottom:none;}tr:hover td{background:#f8fafc;}
-    .empty{text-align:center;padding:60px;color:#94a3b8;font-size:16px;}
-    </style><meta http-equiv="refresh" content="30"></head><body>
-    <div class="header">
-      <h1>Tenant Flow AI — ${manager.name}</h1>
-      <div class="header-right"><span>Auto-refreshes every 30s</span><a href="/dashboard/logout" class="logout">Sign Out</a></div>
-    </div>
-    <div class="stats">
-      <div class="stat"><div class="num">${total}</div><div class="label">Total Requests</div></div>
-      <div class="stat"><div class="num" style="color:#f97316">${active}</div><div class="label">Active</div></div>
-      <div class="stat"><div class="num" style="color:#22c55e">${completed}</div><div class="label">Completed</div></div>
-      <div class="stat"><div class="num" style="color:#ef4444">${emergency}</div><div class="label">Emergencies</div></div>
-    </div>
-    <div class="filters">
-      <a href="/dashboard?filter=all" class="${filter==="all"?"active":""}">All</a>
-      <a href="/dashboard?filter=active" class="${filter==="active"?"active":""}">Active</a>
-      <a href="/dashboard?filter=completed" class="${filter==="completed"?"active":""}">Completed</a>
-      <a href="/dashboard?filter=scheduled" class="${filter==="scheduled"?"active":""}">Scheduled</a>
-    </div>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Time</th><th>Property</th><th>Tenant</th><th>Urgency</th><th>Category</th><th>Issue</th><th>Availability</th><th>Status</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="8" class="empty">No requests found</td></tr>'}</tbody>
-    </table></div></body></html>
-  `);
+  res.send(`<html><head><title>${manager.name} — Dashboard</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f1f5f9;color:#1e293b;}.header{background:#1e293b;color:white;padding:20px 32px;display:flex;align-items:center;justify-content:space-between;}.header h1{font-size:20px;}.header-right{display:flex;align-items:center;gap:16px;}.header-right span{font-size:13px;color:#94a3b8;}.logout{font-size:13px;color:#94a3b8;text-decoration:none;padding:6px 12px;border:1px solid #475569;border-radius:6px;}.stats{display:flex;gap:16px;padding:24px 32px;flex-wrap:wrap;}.stat{background:white;border-radius:12px;padding:20px 24px;flex:1;min-width:140px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}.stat .num{font-size:32px;font-weight:bold;}.stat .label{font-size:13px;color:#64748b;margin-top:4px;}.filters{padding:0 32px 16px;display:flex;gap:8px;flex-wrap:wrap;}.filters a{padding:8px 16px;border-radius:20px;text-decoration:none;font-size:13px;font-weight:bold;background:white;color:#64748b;}.filters a.active{background:#1e293b;color:white;}.table-wrap{padding:0 32px 32px;overflow-x:auto;}table{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);}th{background:#f8fafc;text-align:left;padding:12px 16px;font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e2e8f0;}td{padding:14px 16px;font-size:14px;border-bottom:1px solid #f1f5f9;vertical-align:middle;}tr:last-child td{border-bottom:none;}tr:hover td{background:#f8fafc;}.empty{text-align:center;padding:60px;color:#94a3b8;font-size:16px;}</style><meta http-equiv="refresh" content="30"></head><body>
+    <div class="header"><h1>Tenant Flow AI — ${manager.name}</h1><div class="header-right"><span>Auto-refreshes every 30s</span><a href="/dashboard/logout" class="logout">Sign Out</a></div></div>
+    <div class="stats"><div class="stat"><div class="num">${total}</div><div class="label">Total</div></div><div class="stat"><div class="num" style="color:#f97316">${active}</div><div class="label">Active</div></div><div class="stat"><div class="num" style="color:#22c55e">${completed}</div><div class="label">Completed</div></div><div class="stat"><div class="num" style="color:#ef4444">${emergency}</div><div class="label">Emergencies</div></div></div>
+    <div class="filters"><a href="/dashboard?filter=all" class="${filter==="all"?"active":""}">All</a><a href="/dashboard?filter=active" class="${filter==="active"?"active":""}">Active</a><a href="/dashboard?filter=completed" class="${filter==="completed"?"active":""}">Completed</a><a href="/dashboard?filter=scheduled" class="${filter==="scheduled"?"active":""}">Scheduled</a></div>
+    <div class="table-wrap"><table><thead><tr><th>Time</th><th>Property</th><th>Tenant</th><th>Urgency</th><th>Category</th><th>Issue</th><th>Availability</th><th>Status</th></tr></thead><tbody>${rows||'<tr><td colspan="8" class="empty">No requests found</td></tr>'}</tbody></table></div></body></html>`);
 });
 
 app.post("/dashboard/status/:id", checkManagerAuth, async (req, res) => {
-  const { status } = req.body;
-  await pool.query("UPDATE requests SET status = $1, updated_at = NOW() WHERE id = $2", [status, req.params.id]);
+  await pool.query("UPDATE requests SET status = $1, updated_at = NOW() WHERE id = $2", [req.body.status, req.params.id]);
   res.redirect("/dashboard" + (req.headers.referer?.includes("filter=") ? "?" + req.headers.referer.split("?")[1] : ""));
 });
 
@@ -1039,324 +1922,30 @@ app.get("/dashboard/logout", (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// HOMEPAGE — MARKETING LANDING PAGE
+// SMS ENDPOINT — ROUTES TO TENANT FLOW OR STR
 // ─────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.status(200).send(`
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tenant Flow AI — AI-Powered Maintenance for Property Managers</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; color: #1e293b; background: white; }
-
-    /* NAV */
-    nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; background: rgba(255,255,255,0.95); backdrop-filter: blur(8px); border-bottom: 1px solid #e2e8f0; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
-    .nav-logo { font-size: 20px; font-weight: 800; color: #1e293b; text-decoration: none; }
-    .nav-logo span { color: #22c55e; }
-    .nav-links { display: flex; align-items: center; gap: 24px; }
-    .nav-links a { font-size: 14px; color: #64748b; text-decoration: none; font-weight: 500; }
-    .nav-links a:hover { color: #1e293b; }
-    .nav-cta { background: #1e293b; color: white !important; padding: 10px 20px; border-radius: 8px; font-weight: 700 !important; font-size: 14px !important; }
-    .nav-cta:hover { background: #334155 !important; color: white !important; }
-
-    /* HERO */
-    .hero { padding: 140px 32px 80px; text-align: center; background: linear-gradient(180deg, #f8fafc 0%, white 100%); }
-    .hero-badge { display: inline-flex; align-items: center; gap: 8px; background: #dcfce7; color: #15803d; padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 700; margin-bottom: 24px; }
-    .hero-badge::before { content: "●"; color: #22c55e; }
-    .hero h1 { font-size: clamp(36px, 6vw, 64px); font-weight: 800; line-height: 1.1; color: #0f172a; max-width: 800px; margin: 0 auto 24px; }
-    .hero h1 span { color: #22c55e; }
-    .hero p { font-size: clamp(16px, 2vw, 20px); color: #64748b; max-width: 600px; margin: 0 auto 40px; line-height: 1.6; }
-    .hero-btns { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
-    .btn-primary { background: #1e293b; color: white; padding: 16px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; transition: background 0.2s; }
-    .btn-primary:hover { background: #334155; }
-    .btn-secondary { background: white; color: #1e293b; padding: 16px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; text-decoration: none; border: 2px solid #e2e8f0; transition: border-color 0.2s; }
-    .btn-secondary:hover { border-color: #94a3b8; }
-
-    /* PHONE MOCKUP */
-    .mockup-section { padding: 40px 32px 80px; display: flex; justify-content: center; }
-    .phone { background: #1e293b; border-radius: 40px; padding: 24px 16px; width: 280px; box-shadow: 0 40px 80px rgba(0,0,0,0.2); }
-    .phone-screen { background: #f1f5f9; border-radius: 28px; padding: 20px 16px; min-height: 380px; }
-    .phone-header { text-align: center; font-size: 13px; font-weight: 700; color: #1e293b; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0; }
-    .msg { margin-bottom: 12px; }
-    .msg-bubble { padding: 10px 14px; border-radius: 18px; font-size: 13px; line-height: 1.4; max-width: 85%; }
-    .msg.tenant { display: flex; justify-content: flex-end; }
-    .msg.tenant .msg-bubble { background: #1e293b; color: white; border-bottom-right-radius: 4px; }
-    .msg.ai .msg-bubble { background: white; color: #1e293b; border-bottom-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-    .msg-label { font-size: 10px; color: #94a3b8; margin-bottom: 4px; text-align: right; }
-    .msg.ai .msg-label { text-align: left; }
-
-    /* STATS */
-    .stats-bar { background: #1e293b; padding: 48px 32px; }
-    .stats-inner { max-width: 900px; margin: 0 auto; display: flex; gap: 48px; justify-content: center; flex-wrap: wrap; text-align: center; }
-    .stat-item .num { font-size: 48px; font-weight: 800; color: #22c55e; }
-    .stat-item .label { font-size: 15px; color: #94a3b8; margin-top: 4px; }
-
-    /* HOW IT WORKS */
-    .section { padding: 80px 32px; max-width: 1100px; margin: 0 auto; }
-    .section-label { font-size: 13px; font-weight: 700; color: #22c55e; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 12px; }
-    .section h2 { font-size: clamp(28px, 4vw, 44px); font-weight: 800; color: #0f172a; margin-bottom: 16px; }
-    .section > p { font-size: 18px; color: #64748b; max-width: 600px; margin-bottom: 56px; line-height: 1.6; }
-    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 32px; }
-    .step { background: #f8fafc; border-radius: 16px; padding: 28px; border: 1px solid #e2e8f0; }
-    .step-num { width: 40px; height: 40px; background: #1e293b; color: white; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 800; margin-bottom: 16px; }
-    .step h3 { font-size: 18px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
-    .step p { font-size: 14px; color: #64748b; line-height: 1.6; }
-
-    /* FEATURES */
-    .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; }
-    .feature { background: white; border: 1px solid #e2e8f0; border-radius: 16px; padding: 28px; transition: box-shadow 0.2s; }
-    .feature:hover { box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
-    .feature-icon { font-size: 32px; margin-bottom: 16px; }
-    .feature h3 { font-size: 17px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
-    .feature p { font-size: 14px; color: #64748b; line-height: 1.6; }
-
-    /* PRICING */
-    .pricing-section { background: #f8fafc; padding: 80px 32px; }
-    .pricing-inner { max-width: 900px; margin: 0 auto; text-align: center; }
-    .pricing-inner .section-label { display: block; margin-bottom: 12px; }
-    .pricing-inner h2 { font-size: clamp(28px, 4vw, 44px); font-weight: 800; color: #0f172a; margin-bottom: 16px; }
-    .pricing-inner > p { font-size: 18px; color: #64748b; margin-bottom: 48px; }
-    .pricing-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 24px; text-align: left; }
-    .pricing-card { background: white; border: 2px solid #e2e8f0; border-radius: 20px; padding: 32px; }
-    .pricing-card.popular { border-color: #22c55e; position: relative; }
-    .popular-badge { position: absolute; top: -14px; left: 50%; transform: translateX(-50%); background: #22c55e; color: white; font-size: 12px; font-weight: 700; padding: 4px 16px; border-radius: 20px; white-space: nowrap; }
-    .pricing-card h3 { font-size: 20px; font-weight: 800; color: #0f172a; margin-bottom: 4px; }
-    .pricing-card .price { font-size: 48px; font-weight: 800; color: #0f172a; margin: 16px 0 4px; }
-    .pricing-card .price span { font-size: 16px; color: #64748b; font-weight: 400; }
-    .pricing-card .units { font-size: 14px; color: #64748b; margin-bottom: 24px; }
-    .pricing-card ul { list-style: none; margin-bottom: 32px; }
-    .pricing-card li { font-size: 14px; color: #374151; padding: 6px 0; display: flex; align-items: center; gap: 8px; }
-    .pricing-card li::before { content: "✓"; color: #22c55e; font-weight: 700; }
-    .btn-plan { display: block; text-align: center; padding: 14px; border-radius: 10px; font-size: 15px; font-weight: 700; text-decoration: none; background: #1e293b; color: white; }
-    .btn-plan.green { background: #22c55e; }
-    .btn-plan:hover { opacity: 0.9; }
-
-    /* TESTIMONIAL */
-    .testimonial-section { padding: 80px 32px; max-width: 800px; margin: 0 auto; text-align: center; }
-    .quote { font-size: clamp(20px, 3vw, 28px); font-weight: 600; color: #0f172a; line-height: 1.5; margin-bottom: 24px; font-style: italic; }
-    .quote-author { font-size: 15px; color: #64748b; }
-
-    /* CTA */
-    .cta-section { background: #1e293b; padding: 80px 32px; text-align: center; }
-    .cta-section h2 { font-size: clamp(28px, 4vw, 48px); font-weight: 800; color: white; margin-bottom: 16px; }
-    .cta-section p { font-size: 18px; color: #94a3b8; margin-bottom: 40px; }
-    .btn-cta { background: #22c55e; color: white; padding: 18px 40px; border-radius: 12px; font-size: 18px; font-weight: 700; text-decoration: none; display: inline-block; transition: background 0.2s; }
-    .btn-cta:hover { background: #16a34a; }
-
-    /* FOOTER */
-    footer { background: #0f172a; padding: 32px; text-align: center; }
-    footer p { font-size: 13px; color: #475569; }
-    footer a { color: #64748b; text-decoration: none; margin: 0 8px; }
-    footer a:hover { color: #94a3b8; }
-  </style>
-</head>
-<body>
-
-  <!-- NAV -->
-  <nav>
-    <a href="/" class="nav-logo">Tenant Flow <span>AI</span></a>
-    <div class="nav-links">
-      <a href="#how-it-works">How It Works</a>
-      <a href="#features">Features</a>
-      <a href="#pricing">Pricing</a>
-      <a href="https://calendly.com/morgaw23/30min" target="_blank" class="nav-cta">Book a Demo</a>
-    </div>
-  </nav>
-
-  <!-- HERO -->
-  <div class="hero">
-    <div class="hero-badge">AI-Powered Property Management</div>
-    <h1>Stop Answering <span>Maintenance Calls.</span> Let AI Handle It.</h1>
-    <p>Tenant Flow AI handles every maintenance request automatically — from the first text to dispatching the right technician. No calls. No back and forth. Just results.</p>
-    <div class="hero-btns">
-      <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-primary">📅 Book a Free Demo</a>
-      <a href="#how-it-works" class="btn-secondary">See How It Works</a>
-    </div>
-  </div>
-
-  <!-- PHONE MOCKUP -->
-  <div class="mockup-section">
-    <div class="phone">
-      <div class="phone-screen">
-        <div class="phone-header">Tenant Flow AI</div>
-        <div class="msg tenant"><div><div class="msg-label">Tenant</div><div class="msg-bubble">My kitchen sink is leaking badly</div></div></div>
-        <div class="msg ai"><div><div class="msg-label">Tenant Flow AI</div><div class="msg-bubble">Got it! A leaking sink needs quick attention. What's your unit address?</div></div></div>
-        <div class="msg tenant"><div><div class="msg-label">Tenant</div><div class="msg-bubble">324 Warner St Apt 2</div></div></div>
-        <div class="msg ai"><div><div class="msg-label">Tenant Flow AI</div><div class="msg-bubble">When would work best for a technician to come by?</div></div></div>
-        <div class="msg tenant"><div><div class="msg-label">Tenant</div><div class="msg-bubble">Tomorrow morning</div></div></div>
-        <div class="msg ai"><div><div class="msg-label">Tenant Flow AI</div><div class="msg-bubble">You're all set! A plumber will reach out to confirm your appointment. 🔧</div></div></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- STATS -->
-  <div class="stats-bar">
-    <div class="stats-inner">
-      <div class="stat-item"><div class="num">24/7</div><div class="label">Always available for tenants</div></div>
-      <div class="stat-item"><div class="num">2 min</div><div class="label">Average response time</div></div>
-      <div class="stat-item"><div class="num">0</div><div class="label">Calls you have to take</div></div>
-      <div class="stat-item"><div class="num">100%</div><div class="label">Requests tracked & logged</div></div>
-    </div>
-  </div>
-
-  <!-- HOW IT WORKS -->
-  <div class="section" id="how-it-works">
-    <div class="section-label">How It Works</div>
-    <h2>From tenant text to technician dispatched — automatically.</h2>
-    <p>No apps to download. No portals to log into. Just a phone number your tenants text.</p>
-    <div class="steps">
-      <div class="step"><div class="step-num">1</div><h3>Tenant Texts In</h3><p>Tenant texts your dedicated number describing their issue. No app needed — just a normal text message.</p></div>
-      <div class="step"><div class="step-num">2</div><h3>AI Collects Details</h3><p>Tenant Flow AI asks follow-up questions to get the address, issue details, and availability. All automatically.</p></div>
-      <div class="step"><div class="step-num">3</div><h3>Right Tech Gets Alerted</h3><p>The system classifies the issue — plumbing, electrical, HVAC, etc. — and texts the right maintenance person immediately.</p></div>
-      <div class="step"><div class="step-num">4</div><h3>Tenant Gets Updated</h3><p>When the tech responds, the tenant automatically gets a status update. Everyone stays in the loop without you lifting a finger.</p></div>
-    </div>
-  </div>
-
-  <!-- FEATURES -->
-  <div class="section" id="features">
-    <div class="section-label">Features</div>
-    <h2>Everything you need. Nothing you don't.</h2>
-    <p>Built specifically for property managers who are tired of being the middleman.</p>
-    <div class="features-grid">
-      <div class="feature"><div class="feature-icon">🤖</div><h3>AI-Powered Conversations</h3><p>Claude AI handles every tenant interaction naturally — asking the right questions and collecting everything needed to dispatch the right person.</p></div>
-      <div class="feature"><div class="feature-icon">🔧</div><h3>Smart Maintenance Routing</h3><p>Issues are automatically categorized — plumbing, electrical, HVAC, structural, pest control, appliances — and routed to the right team.</p></div>
-      <div class="feature"><div class="feature-icon">🚨</div><h3>Emergency Detection</h3><p>Gas leaks, flooding, and electrical hazards are flagged as emergencies and escalated immediately — no delay.</p></div>
-      <div class="feature"><div class="feature-icon">📊</div><h3>Real-Time Dashboard</h3><p>See all active requests, track urgency levels, update statuses, and manage your entire portfolio from one clean dashboard.</p></div>
-      <div class="feature"><div class="feature-icon">💬</div><h3>Two-Way Status Updates</h3><p>Maintenance techs text back their status — Done, Scheduled, On My Way — and tenants get automatically notified.</p></div>
-      <div class="feature"><div class="feature-icon">📱</div><h3>Works on Any Phone</h3><p>No app downloads. No tenant training required. Just a phone number they text — exactly like texting a friend.</p></div>
-    </div>
-  </div>
-
-  <!-- PRICING REPLACED WITH CTA -->
-  <div class="pricing-section" id="pricing">
-    <div class="pricing-inner">
-      <span class="section-label">Pricing</span>
-      <h2>Custom pricing for your portfolio.</h2>
-      <p>Every property management operation is different. Book a free demo and we'll build a plan around your portfolio size, team, and goals.</p>
-
-      <div style="display:flex;gap:32px;justify-content:center;flex-wrap:wrap;margin-bottom:48px;">
-        <div style="background:white;border-radius:16px;padding:28px 32px;flex:1;min-width:220px;max-width:300px;box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;">
-          <div style="font-size:36px;margin-bottom:12px;">🏢</div>
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;">Small Portfolios</h3>
-          <p style="font-size:14px;color:#64748b;line-height:1.6;">Perfect for independent landlords and small property managers with a handful of units.</p>
-        </div>
-        <div style="background:white;border-radius:16px;padding:28px 32px;flex:1;min-width:220px;max-width:300px;box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;border:2px solid #22c55e;">
-          <div style="font-size:36px;margin-bottom:12px;">🏙️</div>
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;">Growing Portfolios</h3>
-          <p style="font-size:14px;color:#64748b;line-height:1.6;">Ideal for property managers scaling up with multiple properties and maintenance teams.</p>
-        </div>
-        <div style="background:white;border-radius:16px;padding:28px 32px;flex:1;min-width:220px;max-width:300px;box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;">
-          <div style="font-size:36px;margin-bottom:12px;">🏗️</div>
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:8px;">Large Operations</h3>
-          <p style="font-size:14px;color:#64748b;line-height:1.6;">Built for large property management companies with hundreds of units and multiple managers.</p>
-        </div>
-      </div>
-
-      <div style="background:#1e293b;border-radius:16px;padding:40px;text-align:center;">
-        <h3 style="font-size:26px;font-weight:800;color:white;margin-bottom:12px;">See exactly what it costs for your portfolio</h3>
-        <p style="font-size:16px;color:#94a3b8;margin-bottom:28px;max-width:500px;margin-left:auto;margin-right:auto;">No sales pressure. Just a free 30-minute demo where we show you the product live and build a custom quote around your operation.</p>
-        <a href="https://calendly.com/morgaw23/30min" target="_blank" style="display:inline-block;background:#22c55e;color:white;padding:16px 36px;border-radius:10px;font-size:16px;font-weight:700;text-decoration:none;">📅 Book Your Free Demo</a>
-        <p style="font-size:13px;color:#475569;margin-top:16px;">No commitment. No credit card. Just 30 minutes.</p>
-      </div>
-    </div>
-  </div>
-
-  <!-- FAQ -->
-  <div style="padding:80px 32px;background:#f8fafc;">
-    <div style="max-width:800px;margin:0 auto;">
-      <p style="font-size:13px;font-weight:700;color:#22c55e;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:12px;">FAQ</p>
-      <h2 style="font-size:clamp(28px,4vw,44px);font-weight:800;color:#0f172a;margin-bottom:48px;">Common questions answered.</h2>
-
-      <div style="display:flex;flex-direction:column;gap:16px;">
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">Do tenants need to download an app?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">No — tenants just send a normal text message to a dedicated phone number. Nothing to download, no account to create, no portal to log into. If they can text a friend they can use Tenant Flow AI.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">Do I have to replace my current property management software?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">Not at all. Tenant Flow AI runs alongside whatever you already use for rent collection, leases, and accounting. We specifically handle the maintenance communication piece — the part that's eating your time.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">What happens if there's an emergency like a gas leak or flooding?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">Tenant Flow AI automatically detects emergency keywords and escalates immediately — skipping the normal availability questions and alerting your maintenance team right away. No delay, no waiting.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">How long does setup take?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">Under 10 minutes. We set up your dedicated phone number, add your maintenance contacts, and you're live. Tenants can start texting the same day.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">What types of maintenance issues does it handle?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">Everything — plumbing, electrical, HVAC, structural, pest control, security, appliances, and general maintenance. The AI automatically categorizes the issue and routes it to the right person on your team.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">How does the maintenance person get notified?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">They get a text message with everything they need — the property address, tenant phone number, issue description, and tenant availability. They can then contact the tenant directly to confirm the appointment.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">What if the AI misunderstands something?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">Every conversation is logged and visible in your dashboard in real time. You can see exactly what was said and step in at any point. In practice the AI handles the vast majority of requests accurately.</p>
-        </div>
-
-        <div style="background:white;border-radius:16px;padding:28px;border:1px solid #e2e8f0;">
-          <h3 style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:10px;">Is there a contract or commitment?</h3>
-          <p style="font-size:15px;color:#64748b;line-height:1.7;">No contracts. No long-term commitments. You can cancel anytime. We're confident you'll stay because the product saves you real time every single week.</p>
-        </div>
-
-      </div>
-    </div>
-  </div>
-
-  <!-- CTA -->
-  <div class="cta-section">
-    <h2>Ready to stop answering maintenance calls?</h2>
-    <p>Book a free 30-minute demo and see Tenant Flow AI in action.</p>
-    <a href="https://calendly.com/morgaw23/30min" target="_blank" class="btn-cta">📅 Book Your Free Demo</a>
-  </div>
-
-  <!-- FOOTER -->
-  <footer>
-    <p>
-      &copy; 2026 Tenant Flow AI. Owned and operated by Wyatt D Morgan.
-      &nbsp;|&nbsp;
-      <a href="/privacy">Privacy Policy</a>
-      <a href="/terms">Terms</a>
-      <a href="/dashboard/login">Client Login</a>
-    </p>
-  </footer>
-
-</body>
-</html>
-  `);
-});
-
-// ─────────────────────────────────────────────
-// SMS ENDPOINT
-// ─────────────────────────────────────────────
-app.get("/sms", (req, res) => res.status(200).send("SMS endpoint alive. Twilio must POST here."));
+app.get("/sms", (req, res) => res.status(200).send("SMS endpoint alive."));
 
 app.post("/sms", async (req, res) => {
-  const from    = req.body.From || "";
-  const to      = req.body.To || TWILIO_PHONE_NUMBER;
-  const body    = (req.body.Body || "").trim();
+  const from = req.body.From || "";
+  const to   = req.body.To || TWILIO_PHONE_NUMBER;
+  const body = (req.body.Body || "").trim();
   const keyword = body.toUpperCase();
 
-  console.log(`Incoming SMS | From: ${from} | To: ${to} | Message: ${body}`);
+  console.log(`Incoming SMS | From: ${from} | To: ${to} | Body: ${body}`);
 
-  // Look up which manager this number belongs to
+  // ── ROUTE: STR HOST? ─────────────────────────
+  const strHost = await getStrHostByTwilioNumber(to);
+  if (strHost) {
+    res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
+    await handleStrSms(strHost, from, body);
+    return;
+  }
+
+  // ── ROUTE: PROPERTY MANAGER (existing flow) ──
   const manager = await getManagerByTwilioNumber(to);
   if (!manager) {
-    console.error(`[ERROR] No manager found for Twilio number: ${to}`);
+    console.error(`[ERROR] No manager or STR host found for Twilio number: ${to}`);
     return res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
   }
 
@@ -1373,7 +1962,6 @@ app.post("/sms", async (req, res) => {
     return res.status(200).set("Content-Type", "text/xml").send(twimlResponse(HELP_REPLY));
   }
 
-  // Check if this is a maintenance person replying
   const maintenancePhones = await getAllMaintenancePhones(manager.id);
   if (maintenancePhones.has(from)) {
     res.status(200).set("Content-Type", "text/xml").send(emptyTwiml());
@@ -1395,8 +1983,12 @@ app.post("/sms", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// PRIVACY & TERMS
+// HOMEPAGE + STATIC PAGES (existing)
 // ─────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.redirect("/dashboard/login");
+});
+
 app.get("/privacy", (req, res) => {
   res.status(200).send('<html><head><title>Privacy Policy</title><style>body{font-family:Arial,sans-serif;background:#f5f7fb;padding:40px;color:#333;max-width:900px;margin:auto;line-height:1.7;}h1{font-size:36px;margin-bottom:20px;}h2{font-size:24px;margin-top:30px;}p{font-size:18px;margin-bottom:15px;}</style></head><body><h1>Privacy Policy</h1><p>Tenant Flow AI collects phone numbers, addresses, and message content to facilitate communication between tenants and maintenance personnel.</p><h2>Information We Collect</h2><p>We collect phone numbers, unit addresses, message content, maintenance issue details, and communication history.</p><h2>How We Use Information</h2><p>We use this information solely for service-related communication including maintenance requests, scheduling updates, and property management communication.</p><h2>Information Sharing</h2><p>Tenant Flow AI does not sell or share personal information with third parties for marketing purposes. Mobile numbers are never sold or shared.</p><h2>SMS Messaging and Opt-In</h2><p>Users opt in by sending the first text message to Tenant Flow AI. Upon first contact, users automatically receive a confirmation message. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for assistance.</p><h2>Opt-Out</h2><p>Users may opt out at any time by replying STOP.</p><h2>Contact</h2><p>wyattmorgan@tenant-flow-ai.com</p></body></html>');
 });
@@ -1405,16 +1997,14 @@ app.get("/terms", (req, res) => {
   res.status(200).send('<html><head><title>Terms and Conditions</title><style>body{font-family:Arial,sans-serif;background:#f5f7fb;padding:40px;color:#333;max-width:900px;margin:auto;line-height:1.7;}h1{font-size:36px;margin-bottom:20px;}h2{font-size:24px;margin-top:30px;}p{font-size:18px;margin-bottom:15px;}</style></head><body><h1>Terms and Conditions</h1><p>These Terms govern the use of Tenant Flow AI messaging services.</p><h2>Program Description</h2><p>Tenant Flow AI provides SMS-based communication for maintenance requests, scheduling, and property management communication.</p><h2>Consent to Receive Messages</h2><p>Users consent by sending the first text message. Upon first contact, users receive an opt-in confirmation recorded with a timestamp.</p><h2>Message Frequency</h2><p>Message frequency varies depending on maintenance activity.</p><h2>Fees</h2><p>Message and data rates may apply.</p><h2>Opt-Out</h2><p>Reply STOP at any time.</p><h2>Help</h2><p>Reply HELP for assistance.</p><h2>Support</h2><p>wyattmorgan@tenant-flow-ai.com</p></body></html>');
 });
 
-// ─────────────────────────────────────────────
-// 404
-// ─────────────────────────────────────────────
 app.use((req, res) => res.status(404).send("Not Found: " + req.method + " " + req.path));
 
 // ─────────────────────────────────────────────
-// START SERVER
+// START
 // ─────────────────────────────────────────────
 const port = process.env.PORT || 3000;
 initDb().then(() => {
+  syncAllIcal(); // Initial sync on startup
   app.listen(port, () => console.log("Server running on port " + port));
 }).catch(err => {
   console.error("[DB INIT ERROR]", err);
