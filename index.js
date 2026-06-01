@@ -151,10 +151,7 @@ if (GMAIL_USER && GMAIL_PASS) {
     host: "smtp.gmail.com", port: 587, secure: false,
     auth: { user: GMAIL_USER, pass: GMAIL_PASS },
   });
-  transporter.verify(err => {
-    if (err) console.error("[EMAIL VERIFY ERROR]", err.message);
-    else console.log("[EMAIL READY]");
-  });
+  console.log("[EMAIL CONFIGURED]");
 }
 
 // ─────────────────────────────────────────────
@@ -676,7 +673,7 @@ async function checkHostAuth(req, res, next) {
   if (!hostId) return res.redirect("/login");
   const host = await getHostById(parseInt(hostId));
   if (!host || host.dashboard_password !== hostPass) return res.redirect("/login");
-  req.host = host;
+  req.currentHost = host;
   next();
 }
 
@@ -710,7 +707,7 @@ app.get("/logout", (req, res) => {
 });
 
 app.get("/dashboard", checkHostAuth, async (req, res) => {
-  const host = req.host;
+  const host = req.currentHost;
   const properties = await getPropertiesByHost(host.id);
   const today = new Date().toISOString().split("T")[0];
 
@@ -743,7 +740,7 @@ function propertyForm(property = {}, action = "/properties", method = "POST") {
 app.get("/properties/new", checkHostAuth, (req, res) => res.send(propertyForm({}, "/properties")));
 
 app.post("/properties", checkHostAuth, async (req, res) => {
-  const host = req.host;
+  const host = req.currentHost;
   const b = req.body;
   await pool.query(`
     INSERT INTO properties (host_id, name, address, ical_url, ical_url_2, wifi_name, wifi_password, door_code, checkin_time, checkout_time, parking_instructions, key_dropoff, thermostat_instructions, washer_dryer_instructions, tv_instructions, trash_instructions, house_rules, quiet_hours_start, quiet_hours_end, breaker_location, water_shutoff, nearest_urgent_care, local_restaurants, local_grocery, local_coffee, local_activities, extra_notes)
@@ -754,12 +751,12 @@ app.post("/properties", checkHostAuth, async (req, res) => {
 
 app.get("/properties/:id/edit", checkHostAuth, async (req, res) => {
   const property = await getPropertyById(parseInt(req.params.id));
-  if (!property || property.host_id !== req.host.id) return res.redirect("/dashboard");
+  if (!property || property.host_id !== req.currentHost.id) return res.redirect("/dashboard");
   res.send(propertyForm(property, `/properties/${property.id}`, "POST"));
 });
 
 app.post("/properties/:id", checkHostAuth, async (req, res) => {
-  const host = req.host;
+  const host = req.currentHost;
   const b = req.body;
   const id = parseInt(req.params.id);
   await pool.query(`
@@ -771,7 +768,7 @@ app.post("/properties/:id", checkHostAuth, async (req, res) => {
 
 app.post("/properties/:id/sync", checkHostAuth, async (req, res) => {
   const property = await getPropertyById(parseInt(req.params.id));
-  if (property && property.host_id === req.host.id) await syncIcalForProperty(property);
+  if (property && property.host_id === req.currentHost.id) await syncIcalForProperty(property);
   res.redirect("/dashboard");
 });
 
