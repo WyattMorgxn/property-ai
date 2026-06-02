@@ -643,8 +643,8 @@ async function escalateToHost(host, guestPhone, property, issue, isEmerg) {
 async function processGuestMessage(host, guestPhone, message, property, booking) {
   const startTime = Date.now();
   try {
-    await addMessage(guestPhone, host.id, "user", message);
     const convo = await getConversation(guestPhone, host.id);
+    await addMessage(guestPhone, host.id, "user", message);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -653,13 +653,25 @@ async function processGuestMessage(host, guestPhone, message, property, booking)
         model: "claude-haiku-4-5-20251001",
         max_tokens: 500,
         system: buildSystemPrompt(property, booking),
-        messages: convo.messages,
+        messages: [...convo.messages, { role: "user", content: message }],
         tools: [{ type: "web_search_20250305", name: "web_search" }]
       }),
     });
 
     const data = await response.json();
     const latency = Date.now() - startTime;
+
+    // Log web search activity (Bug 3 fix)
+    if (Array.isArray(data.content)) {
+      const searchBlocks = data.content.filter(b => b.type === 'server_tool_use' && b.name === 'web_search');
+      for (const block of searchBlocks) {
+        console.log(`[WEB SEARCH] query="${block.input?.query}" guest=${guestPhone?.slice(-4)} property=${property?.id}`);
+      }
+      if (searchBlocks.length > 0) {
+        const resultCount = data.content.filter(b => b.type === 'web_search_tool_result').length;
+        console.log(`[WEB SEARCH RESULT] ${resultCount} results returned`);
+      }
+    }
 
     if (!response.ok) {
       console.error("[CLAUDE ERROR]", data);
