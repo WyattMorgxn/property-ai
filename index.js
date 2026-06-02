@@ -1029,98 +1029,58 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// ── CONVERSATIONS VIEW ──────────────────────────────────────────────────────
+// ── CONVERSATIONS VIEW ────────────────────────────────────────────
 app.get("/conversations", requireAuth, async (req, res) => {
   try {
     const host = req.currentHost;
-    const convos = await db.query(`
-      SELECT c.id, c.guest_phone, c.messages, c.escalated, c.updated_at,
-             p.name as property_name, p.address
-      FROM conversations c
-      JOIN properties p ON c.property_id = p.id
-      WHERE p.host_id = $1
-      ORDER BY c.updated_at DESC
-      LIMIT 50
-    `, [host.id]);
-
-    const rows = convos.rows.map(c => {
+    const result = await db.query(
+      `SELECT c.id, c.guest_phone, c.messages, c.escalated, c.updated_at,
+              p.name as property_name, p.address
+       FROM conversations c
+       JOIN properties p ON c.property_id = p.id
+       WHERE p.host_id = $1
+       ORDER BY c.updated_at DESC LIMIT 50`,
+      [host.id]
+    );
+    const rows = result.rows.map(c => {
       const msgs = Array.isArray(c.messages) ? c.messages : [];
-      const ph = c.guest_phone || '';
+      const ph = String(c.guest_phone || '');
       const masked = ph.length > 4 ? ph.slice(0,-4).replace(/\d/g,'*') + ph.slice(-4) : ph;
       return { ...c, guest_phone: masked, messages: msgs };
     });
-
-    res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Tenario — Conversations</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f6f8;color:#1a2236;min-height:100vh}
-.topbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
-.logo{font-weight:800;font-size:18px;color:#10b981}
-.nav a{text-decoration:none;color:#64748b;font-size:14px;font-weight:500;margin-left:16px}
-.nav a:hover,.nav a.active{color:#10b981}
-.page{max-width:900px;margin:32px auto;padding:0 24px}
-h1{font-size:22px;font-weight:700;margin-bottom:20px}
-.card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden}
-.card-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:#f8fafc;border-bottom:1px solid #e2e8f0;flex-wrap:wrap;gap:8px}
-.meta strong{color:#1a2236;font-weight:600;font-size:14px}
-.meta small{color:#64748b;font-size:12px;display:block;margin-top:2px}
-.badge{padding:3px 9px;border-radius:10px;font-size:11px;font-weight:700}
-.esc{background:#fef2f2;color:#ef4444;border:1px solid #fecaca}
-.ok{background:#f0fdf4;color:#10b981;border:1px solid #bbf7d0}
-.msgs{padding:14px 18px;display:flex;flex-direction:column;gap:10px;max-height:320px;overflow-y:auto}
-.msg-wrap{display:flex;flex-direction:column}
-.msg-wrap.ai{align-items:flex-end}
-.lbl{font-size:10px;color:#94a3b8;margin-bottom:3px}
-.bubble{max-width:80%;padding:9px 13px;border-radius:12px;font-size:14px;line-height:1.5;white-space:pre-wrap}
-.bubble.guest{background:#f1f5f9;border-radius:12px 12px 12px 2px}
-.bubble.ai{background:#10b981;color:#fff;border-radius:12px 12px 2px 12px}
-.empty{text-align:center;padding:48px;color:#94a3b8;font-size:14px}
-.ts{font-size:11px;color:#94a3b8}
-</style></head><body>
-<div class="topbar">
-  <div class="logo">Tenario</div>
-  <nav class="nav">
-    <a href="/dashboard">Dashboard</a>
-    <a href="/conversations" class="active">Conversations</a>
-    <a href="/conversations">Conversations</a> <a href="/logout">Sign Out</a>
-  </nav>
-</div>
-<div class="page">
-  <h1>Guest Conversations</h1>
-  ${rows.length === 0
-    ? '<div class="empty"><p>No conversations yet. When guests text in, their messages will appear here.</p></div>'
-    : rows.map(c => {
-        const ts = new Date(c.updated_at).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
-        const msgHtml = c.messages.length === 0
-          ? '<p style="color:#94a3b8;font-size:13px;padding:8px 0">No messages logged yet</p>'
-          : c.messages.map(m => {
-              const isGuest = m.role === 'user';
-              const safe = String(m.content || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-              return `<div class="msg-wrap ${isGuest?'':'ai'}">
-                <span class="lbl">${isGuest ? '👤 Guest' : '🤖 Tenario AI'}</span>
-                <div class="bubble ${isGuest?'guest':'ai'}">${safe}</div>
-              </div>`;
-            }).join('');
-        return `<div class="card">
-          <div class="card-head">
-            <div class="meta">
-              <strong>${c.property_name}</strong>
-              <small>Guest: ${c.guest_phone} &nbsp;·&nbsp; ${c.messages.length} message${c.messages.length!==1?'s':''}</small>
-            </div>
-            <div style="display:flex;gap:10px;align-items:center">
-              <span class="badge ${c.escalated?'esc':'ok'}">${c.escalated?'🚨 Escalated':'✅ Resolved'}</span>
-              <span class="ts">${ts}</span>
-            </div>
-          </div>
-          <div class="msgs">${msgHtml}</div>
-        </div>`;
-      }).join('')}
-</div></body></html>`);
+    const cards = rows.length === 0
+      ? '<div style="text-align:center;padding:48px;color:#94a3b8;font-size:14px">No conversations yet. When guests text in, their messages will appear here.</div>'
+      : rows.map(c => {
+          const ts = new Date(c.updated_at).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
+          const msgHtml = c.messages.length === 0
+            ? '<p style="color:#94a3b8;font-size:13px;padding:8px">No messages logged</p>'
+            : c.messages.map(m => {
+                const isGuest = m.role === 'user';
+                const safe = String(m.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                return '<div style="display:flex;flex-direction:column;align-items:' + (isGuest?'flex-start':'flex-end') + ';margin-bottom:10px">'
+                  + '<span style="font-size:10px;color:#94a3b8;margin-bottom:3px">' + (isGuest ? '👤 Guest' : '🤖 Tenario AI') + '</span>'
+                  + '<div style="max-width:80%;padding:10px 14px;border-radius:' + (isGuest?'12px 12px 12px 2px':'12px 12px 2px 12px') + ';background:' + (isGuest?'#f1f5f9':'#10b981') + ';color:' + (isGuest?'#1a2236':'#fff') + ';font-size:14px;line-height:1.5;white-space:pre-wrap">' + safe + '</div>'
+                  + '</div>';
+              }).join('');
+          return '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden">'
+            + '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:#f8fafc;border-bottom:1px solid #e2e8f0;flex-wrap:wrap;gap:8px">'
+            + '<div><strong style="font-size:14px;color:#1a2236">' + c.property_name + '</strong><div style="font-size:12px;color:#64748b;margin-top:3px">Guest: ' + c.guest_phone + ' &nbsp;·&nbsp; ' + c.messages.length + ' message' + (c.messages.length!==1?'s':'') + '</div></div>'
+            + '<div style="display:flex;gap:10px;align-items:center"><span style="padding:3px 9px;border-radius:10px;font-size:11px;font-weight:700;background:' + (c.escalated?'#fef2f2':'#f0fdf4') + ';color:' + (c.escalated?'#ef4444':'#10b981') + ';border:1px solid ' + (c.escalated?'#fecaca':'#bbf7d0') + '">' + (c.escalated?'🚨 Escalated':'✅ Resolved') + '</span>'
+            + '<span style="font-size:11px;color:#94a3b8">' + ts + '</span></div>'
+            + '</div>'
+            + '<div style="padding:14px 18px;display:flex;flex-direction:column;gap:4px;max-height:350px;overflow-y:auto">' + msgHtml + '</div>'
+            + '</div>';
+        }).join('');
+    res.send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tenario - Conversations</title>'
+      + '<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#f4f6f8;color:#1a2236}'
+      + '.topbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}'
+      + '.logo{font-weight:800;font-size:18px;color:#10b981}.nav a{text-decoration:none;color:#64748b;font-size:14px;font-weight:500;margin-left:16px}'
+      + '.nav a:hover{color:#10b981}.page{max-width:920px;margin:32px auto;padding:0 24px}</style></head><body>'
+      + '<div class="topbar"><div class="logo">Tenario</div><nav class="nav"><a href="/dashboard">Dashboard</a><a href="/conversations" style="color:#10b981;font-weight:700">Conversations</a><a href="/conversations">Conversations</a> <a href="/logout">Sign Out</a></nav></div>'
+      + '<div class="page"><h1 style="font-size:22px;font-weight:700;margin-bottom:20px">Guest Conversations</h1>' + cards + '</div></body></html>');
   } catch(err) {
     console.error('[CONVERSATIONS]', err);
-    res.status(500).send('Error loading conversations');
+    res.status(500).send('Error loading conversations: ' + err.message);
   }
 });
 
