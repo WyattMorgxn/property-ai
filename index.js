@@ -1076,12 +1076,44 @@ app.get("/conversations", requireAuth, async (req, res) => {
       + '.topbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}'
       + '.logo{font-weight:800;font-size:18px;color:#10b981}.nav a{text-decoration:none;color:#64748b;font-size:14px;font-weight:500;margin-left:16px}'
       + '.nav a:hover{color:#10b981}.page{max-width:920px;margin:32px auto;padding:0 24px}</style></head><body>'
-      + '<div class="topbar"><div class="logo">Tenario</div><nav class="nav"><a href="/dashboard">Dashboard</a><a href="/conversations" style="color:#10b981;font-weight:700">Conversations</a><a href="/conversations">Conversations</a> <a href="/logout">Sign Out</a></nav></div>'
+      + '<div class="topbar"><div class="logo">Tenario</div><nav class="nav"><a href="/dashboard">Dashboard</a><a href="/conversations" style="color:#10b981;font-weight:700">Conversations</a><a href="/conversations">Conversations</a> <a href="/conversations">Conversations</a> <a href="/logout">Sign Out</a></nav></div>'
       + '<div class="page"><h1 style="font-size:22px;font-weight:700;margin-bottom:20px">Guest Conversations</h1>' + cards + '</div></body></html>');
   } catch(err) {
     console.error('[CONVERSATIONS]', err);
     res.status(500).send('Error loading conversations: ' + err.message);
   }
+});
+
+
+app.get("/conversations", requireAuth, async (req, res) => {
+  try {
+    const host = req.currentHost;
+    const result = await db.query(
+      `SELECT c.id, c.guest_phone, c.messages, c.escalated, c.updated_at, p.name as property_name, p.address
+       FROM conversations c JOIN properties p ON c.property_id = p.id
+       WHERE p.host_id = $1 ORDER BY c.updated_at DESC LIMIT 50`,
+      [host.id]
+    );
+    const rows = result.rows.map(c => {
+      const msgs = Array.isArray(c.messages) ? c.messages : [];
+      const ph = String(c.guest_phone || '');
+      const masked = ph.length > 4 ? ph.slice(0,-4).replace(/\d/g,'*') + ph.slice(-4) : ph;
+      return {...c, guest_phone: masked, messages: msgs};
+    });
+    const cards = rows.length === 0
+      ? '<div style="padding:48px;text-align:center;color:#94a3b8">No conversations yet.</div>'
+      : rows.map(c => {
+          const ts = new Date(c.updated_at).toLocaleString();
+          const msgs = c.messages.map(m => {
+            const g = m.role === 'user';
+            const t = String(m.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            return '<div style="display:flex;flex-direction:column;align-items:' + (g?'flex-start':'flex-end') + ';margin:6px 0"><div style="font-size:10px;color:#94a3b8;margin-bottom:2px">' + (g?'Guest':'AI') + '</div><div style="max-width:78%;padding:8px 12px;border-radius:10px;font-size:14px;background:' + (g?'#f1f5f9':'#10b981') + ';color:' + (g?'#1a2236':'#fff') + '">' + t + '</div></div>';
+          }).join('');
+          return '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:12px;overflow:hidden"><div style="padding:12px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center"><div><strong>' + c.property_name + '</strong><div style="font-size:12px;color:#64748b;margin-top:2px">Guest ' + c.guest_phone + ' · ' + c.messages.length + ' messages</div></div><div style="font-size:11px;color:#94a3b8">' + ts + '</div></div><div style="padding:12px 16px;max-height:300px;overflow-y:auto">' + msgs + '</div></div>';
+        }).join('');
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Conversations - Tenario</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#f4f6f8}.bar{background:#fff;padding:14px 24px;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center}.logo{font-weight:800;color:#10b981;font-size:18px}.nav a{margin-left:14px;text-decoration:none;color:#64748b;font-size:14px}.main{max-width:900px;margin:28px auto;padding:0 20px}h1{font-size:20px;font-weight:700;margin-bottom:18px}</style></head><body><div class="bar"><div class="logo">Tenario</div><nav class="nav"><a href="/dashboard">Dashboard</a><a href="/conversations" style="color:#10b981;font-weight:700">Conversations</a><a href="/logout">Sign Out</a></nav></div><div class="main"><h1>Guest Conversations</h1>' + cards + '</div></body></html>';
+    res.send(html);
+  } catch(err) { console.error('[CONV]', err); res.status(500).send('Error: ' + err.message); }
 });
 
 app.get("/logout", (req, res) => {
