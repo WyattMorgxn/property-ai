@@ -555,7 +555,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 function buildPropertyContext(property, booking) {
   const lines = [
     `Property address: ${property.address}`,
-    `Check-in time: ${property.checkin_time || `3:00 PM"}`,
+    `Check-in time: ${property.checkin_time || "3:00 PM"}`,
     `Check-out time: ${property.checkout_time || "11:00 AM"}`,
   ];
   const fields = [
