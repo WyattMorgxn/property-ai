@@ -106,6 +106,19 @@ async function initDb() {
       UNIQUE(guest_phone, host_id)
     );
   `);
+  // Remember the guest's pending question while an escalation is open
+  await pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pending_question TEXT`).catch(() => {});
+  // Host-taught answers — the AI's growing per-property memory
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS learned_facts (
+      id SERIAL PRIMARY KEY,
+      property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
+      host_id INTEGER REFERENCES hosts(id) ON DELETE CASCADE,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
   // Structured message logging (privacy-safe: last 4 digits only)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS message_logs (
@@ -513,6 +526,20 @@ async function clearConversation(phone, hostId) {
     "UPDATE conversations SET messages = '[]', escalated = false WHERE guest_phone = $1 AND host_id = $2",
     [phone, hostId]);
 }
+// Host-taught answers the AI has learned for a property (its growing memory)
+async function getLearnedFacts(propertyId) {
+  if (!propertyId) return [];
+  try {
+    const res = await pool.query(
+      "SELECT question, answer FROM learned_facts WHERE property_id = $1 ORDER BY created_at ASC",
+      [propertyId]
+    );
+    return res.rows;
+  } catch (err) {
+    console.error("[LEARNED FACTS ERROR]", err.message);
+    return [];
+  }
+}
 // ─────────────────────────────────────────────
 // CLAUDE AI
 // ─────────────────────────────────────────────
@@ -540,18 +567,22 @@ function buildPropertyContext(property, booking) {
   if (booking?.checkout_date) lines.push(`Guest checkout date: ${booking.checkout_date}`);
   return lines.join("\n");
 }
-function buildSystemPrompt(property, booking) {
+function buildSystemPrompt(property, booking, learnedFacts = []) {
+  const learnedSection = learnedFacts.length
+    ? `\nPREVIOUSLY ANSWERED BY THE HOST (authoritative for this property — use these directly, do NOT escalate again):\n` +
+      learnedFacts.map(f => `Q: ${f.question}\nA: ${f.answer}`).join("\n") + "\n"
+    : "";
   return `You are an AI guest services assistant for a short-term rental, powered by Tenario Guest Services. You help guests via SMS. Keep replies SHORT (1-3 sentences max — this is SMS).
 PROPERTY KNOWLEDGE BASE:
 ${buildPropertyContext(property, booking)}
-RESOLUTION APPROACH:
-1. FIRST check the knowledge base above. If the answer is there, give it directly.
-2. If not in knowledge base, troubleshoot using general knowledge (appliance fixes, common issues, local recommendations).
+${learnedSection}RESOLUTION APPROACH:
+1. FIRST check the knowledge base AND the host's previously-given answers above. If the answer is in either, give it directly.
+2. If not there, troubleshoot using general knowledge (appliance fixes, common issues, local recommendations).
 3. If you can't resolve after trying, escalate by ending your reply with exactly: ESCALATE|<one sentence summary>
 4. For EMERGENCIES (gas leak, fire, flooding, carbon monoxide, break-in), give safety instructions AND end with: EMERGENCY|<summary>
 TONE: Warm, helpful, like a knowledgeable friend.
 LANGUAGE: Auto-detect and reply in the guest's language.
-Never make up facts not in the knowledge base. If unsure, escalate.`;
+Never make up facts not in the knowledge base or the host's previous answers. If unsure, escalate.`;
 }
 function isQuietHours(property) {
   const hour = new Date().getHours();
@@ -572,13 +603,17 @@ function getMillisUntilHour(targetHour) {
   if (target <= now) target.setDate(target.getDate() + 1);
   return target - now;
 }
-async function escalateToHost(host, guestPhone, property, issue, isEmerg) {
+async function escalateToHost(host, guestPhone, property, issue, isEmerg, guestQuestion = null) {
   const msg = `GUEST ALERT${isEmerg ? " — EMERGENCY" : ""}\n` +
     `Property: ${property.address}\nGuest: ${guestPhone}\nIssue: ${issue}\n\n` +
     `Reply to this message — your response will be forwarded to the guest.`;
   await sendSms(host.host_phone, msg, host.twilio_number, host.id);
-  await pool.query("UPDATE conversations SET escalated = true WHERE guest_phone = $1 AND host_id = $2",
-    [guestPhone, host.id]);
+  // Remember the guest's question (non-emergencies only) so we can learn the host's answer
+  const learnQuestion = (!isEmerg && guestQuestion) ? guestQuestion : null;
+  await pool.query(
+    "UPDATE conversations SET escalated = true, property_id = COALESCE($3, property_id), pending_question = $4 WHERE guest_phone = $1 AND host_id = $2",
+    [guestPhone, host.id, property?.id ?? null, learnQuestion]
+  );
   console.log(`[ESCALATE] ${isEmerg ? "EMERGENCY " : ""}${host.name} → ${guestPhone}`);
   if (!isEmerg) {
     setTimeout(async () => {
@@ -601,13 +636,14 @@ async function processGuestMessage(host, guestPhone, message, property, booking)
   try {
     const convo = await getConversation(guestPhone, host.id);
     await addMessage(guestPhone, host.id, "user", message);
+    const learnedFacts = await getLearnedFacts(property?.id);
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 500,
-        system: buildSystemPrompt(property, booking),
+        system: buildSystemPrompt(property, booking, learnedFacts),
         messages: [...convo.messages, { role: "user", content: message }],
         tools: [{ type: "web_search_20250305", name: "web_search" }]
       }),
@@ -654,10 +690,10 @@ async function processGuestMessage(host, guestPhone, message, property, booking)
           host.id
         );
         const ms = getMillisUntilHour(property.quiet_hours_end ?? 8);
-        setTimeout(() => escalateToHost(host, guestPhone, property, escalateMatch[1].trim(), false), ms);
+        setTimeout(() => escalateToHost(host, guestPhone, property, escalateMatch[1].trim(), false, message), ms);
       } else {
         await logMessage(guestPhone, host.id, property?.id, "escalation", latency);
-        await escalateToHost(host, guestPhone, property, escalateMatch[1].trim(), false);
+        await escalateToHost(host, guestPhone, property, escalateMatch[1].trim(), false, message);
       }
     } else {
       await logMessage(guestPhone, host.id, property?.id, "ai_response", latency);
@@ -674,7 +710,7 @@ async function processGuestMessage(host, guestPhone, message, property, booking)
 // ─────────────────────────────────────────────
 async function handleHostReply(host, body) {
   const res = await pool.query(`
-    SELECT guest_phone FROM conversations
+    SELECT guest_phone, property_id, pending_question FROM conversations
     WHERE host_id = $1 AND escalated = true
     ORDER BY updated_at DESC LIMIT 1
   `, [host.id]);
@@ -682,11 +718,32 @@ async function handleHostReply(host, body) {
     await sendSms(host.host_phone, "No open escalations.", host.twilio_number, host.id);
     return;
   }
-  const guestPhone = res.rows[0].guest_phone;
+  const { guest_phone: guestPhone, property_id: propertyId, pending_question: pendingQuestion } = res.rows[0];
   await sendSms(guestPhone, body, host.twilio_number, host.id);
-  await pool.query("UPDATE conversations SET escalated = false WHERE guest_phone = $1 AND host_id = $2",
+  // Keep the host's answer in the guest's conversation history
+  await addMessage(guestPhone, host.id, "assistant", body);
+  // Teach the AI: save this Q&A so it can answer directly next time
+  let learned = false;
+  if (propertyId && pendingQuestion) {
+    try {
+      await pool.query(
+        "INSERT INTO learned_facts (property_id, host_id, question, answer) VALUES ($1, $2, $3, $4)",
+        [propertyId, host.id, pendingQuestion, body]
+      );
+      learned = true;
+      console.log(`[LEARNED] property ${propertyId}: "${pendingQuestion}" -> host answer saved`);
+    } catch (err) {
+      console.error("[LEARN ERROR]", err.message);
+    }
+  }
+  await pool.query("UPDATE conversations SET escalated = false, pending_question = NULL WHERE guest_phone = $1 AND host_id = $2",
     [guestPhone, host.id]);
-  await sendSms(host.host_phone, `Forwarded to guest at ${guestPhone}.`, host.twilio_number, host.id);
+  await sendSms(
+    host.host_phone,
+    `Forwarded to guest at ${guestPhone}.${learned ? " I'll remember this answer for next time." : ""}`,
+    host.twilio_number,
+    host.id
+  );
 }
 // ─────────────────────────────────────────────
 // MAIN SMS HANDLER
@@ -855,6 +912,9 @@ app.use((req, res, next) => {
   next();
 });
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "F@tboyPenny2005";
+if (!process.env.ADMIN_PASSWORD) {
+  console.warn("[SECURITY WARNING] ADMIN_PASSWORD is not set — falling back to the hardcoded password, which is visible in your source code. Set ADMIN_PASSWORD in Railway before launch.");
+}
 function checkAdminAuth(req, res, next) {
   if (req.cookies?.admin_auth === ADMIN_PASSWORD) return next();
   res.redirect("/admin/login");
